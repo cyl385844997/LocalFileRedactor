@@ -17,6 +17,8 @@
 * ``docx_demo_single_run.docx``   手机号完整落在单个 run 内（对照组）
 * ``docx_demo_complex.docx``      含 ``<w:br/>`` 与 ``<w:tab/>`` 的复杂段落，
   用于验证 br/tab 现在能被正常处理且元素不被破坏
+* ``docx_demo_hyperlink.docx``     超链接样例：mailto 链接、https 链接、
+  内部锚点链接、显示文字含邮箱、手机号跨越链接边界
 """
 
 from __future__ import annotations
@@ -28,6 +30,9 @@ from typing import List
 
 from docx import Document
 from docx.enum.text import WD_BREAK
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 # 允许 `python tests/fixtures/make_docx_samples.py` 直接运行：
 # 把 tests/ 目录加入 sys.path，才能 `import fixtures.make_samples`。
@@ -172,9 +177,92 @@ def make_complex_sample() -> Path:
     return path
 
 
+def add_hyperlink(paragraph, url: str, text: str, anchor: str = None) -> str:
+    """给段落插入一个超链接，返回其rId。
+
+    python-docx 没有内置 API，这里手工构造 ``<w:hyperlink>``。
+    注意 Word 的存储方式：**正文只存显示文字 + rId，真实 URL 存在 rels 文件里**。
+
+    Args:
+        paragraph: 目标段落。
+        url: 外部链接地址；内部锚点链接传anchor。
+        text: 显示文字。
+        anchor: 内部锚点名（非空则创建内部链接，不产生 rels 条目）。
+
+    Returns:
+        外部链接的 rId；内部链接返回空串。
+    """
+    hyperlink = OxmlElement("w:hyperlink")
+    if anchor:
+        hyperlink.set(qn("w:anchor"), anchor)
+        r_id = ""
+    else:
+        r_id = paragraph.part.relate_to(
+            url,
+            RT.HYPERLINK,
+            is_external=True,
+        )
+        hyperlink.set(qn("r:id"), r_id)
+
+    run = OxmlElement("w:r")
+    text_element = OxmlElement("w:t")
+    text_element.text = text
+    run.append(text_element)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+    return r_id
+
+
+def make_hyperlink_sample() -> Path:
+    """生成超链接样例（优先级 2）。
+
+    覆盖四种情形：
+        1. mailto 链接（URL 含邮箱，需改写 Target）
+        2. 普通 https 链接（URL 不含敏感信息，应原样保留）
+        3. 内部锚点链接（无外部 URL，只处理显示文字）
+        4. 链接显示文字本身含邮箱（正文脱敏后链接仍存在）
+    """
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLES_DIR / "docx_demo_hyperlink.docx"
+
+    document = Document()
+    document.add_heading("Word 超链接脱敏样例（合成数据）", level=1)
+
+    # 情形 1：mailto 链接，URL 里含邮箱
+    paragraph = document.add_paragraph()
+    paragraph.add_run("联系方式：")
+    add_hyperlink(paragraph, f"mailto:{FAKE_EMAIL}", "点击发邮件")
+
+    # 情形 2：普通 https 链接，URL 不含敏感信息
+    paragraph2 = document.add_paragraph()
+    paragraph2.add_run("参考资料：")
+    add_hyperlink(paragraph2, "https://example.com/contact", "访问联系页")
+
+    # 情形 3：内部锚点链接（无外部 URL）
+    paragraph3 = document.add_paragraph()
+    add_hyperlink(paragraph3, "", "跳转到附录", anchor="appendix1")
+
+    # 情形 4：显示文字本身含邮箱（正文脱敏，链接结构保留）
+    paragraph4 = document.add_paragraph()
+    add_hyperlink(paragraph4, "https://example.com/mail", FAKE_EMAIL)
+
+    # 情形 5：手机号跨越"普通run / 链接文字"边界（验证偏移映射不漏）
+    paragraph5 = document.add_paragraph()
+    paragraph5.add_run("电话 1380013")
+    add_hyperlink(paragraph5, "https://example.com/x", "8000 尾号")
+
+    document.save(str(path))
+    return path
+
+
 def build_all() -> List[Path]:
     """生成全部 docx 样例。"""
-    return [make_split_runs_sample(), make_single_run_sample(), make_complex_sample()]
+    return [
+        make_split_runs_sample(),
+        make_single_run_sample(),
+        make_complex_sample(),
+        make_hyperlink_sample(),
+    ]
 
 
 def clean() -> None:

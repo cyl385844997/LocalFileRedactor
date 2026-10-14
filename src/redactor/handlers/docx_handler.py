@@ -61,6 +61,7 @@ from docx.text.paragraph import Paragraph
 from redactor.core.engine import RedactionEngine
 from redactor.core.models import FileResult, HitStat, Match
 from redactor.handlers.base import BaseHandler, HandlerError, prepare_output
+from redactor.handlers.docx_url import redact_hyperlink_targets
 
 # ---------------------------------------------------------------------------
 # br/tab 支持（优先级 1）
@@ -77,11 +78,14 @@ from redactor.handlers.base import BaseHandler, HandlerError, prepare_output
 #: run 内允许存在的子元素：格式、纯文本、换行符、制表符
 _ALLOWED_RUN_CHILDREN = {qn("w:rPr"), qn("w:t"), qn("w:br"), qn("w:tab"), qn("w:cr")}
 
-#: 段落内允许存在的子元素：只有段落属性和 run（超链接等留给优先级 2）
-_ALLOWED_PARAGRAPH_CHILDREN = {qn("w:pPr"), qn("w:r")}
+#: 段落内允许存在的子元素：段落属性、run、超链接
+_ALLOWED_PARAGRAPH_CHILDREN = {qn("w:pPr"), qn("w:r"), qn("w:hyperlink")}
 
 #: 视为"占一个字符"的元素 -> 该占位字符
 _SPECIAL_CHARS = {qn("w:br"): "\n", qn("w:cr"): "\n", qn("w:tab"): "\t"}
+
+#: mailto: 链接的协议前缀（大小写不敏感）
+_MAILTO_PREFIX = "mailto:"
 
 
 def _run_plain_text(run_element) -> str:
@@ -188,6 +192,21 @@ class DocxHandler(BaseHandler):
             if hits:
                 all_hits.extend(hits)
 
+        # ---- URL 脱敏（rels 文件里的 mailto 链接）----
+        # 必须在 document.save() **之前**做：rels 改动随 save 一并写入。
+        url_hit_count = 0
+        try:
+            url_hits = redact_hyperlink_targets(document.part, engine, dry_run=dry_run)
+            url_hit_count = len(url_hits)
+        except HandlerError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # rels 改写失败不能影响正文脱敏成果，但必须让用户知道
+            raise HandlerError(
+                HandlerError.CORRUPTED,
+                f"超链接目标处理失败：{type(exc).__name__}: {exc}",
+            ) from exc
+
         if not dry_run:
             try:
                 output.parent.mkdir(parents=True, exist_ok=True)
@@ -197,11 +216,26 @@ class DocxHandler(BaseHandler):
             except OSError as exc:
                 raise HandlerError(HandlerError.IO_ERROR, f"写入失败：{output}（{exc}）") from exc
 
+        # URL 命中单独记一条统计（位置标为"超链接目标"，不含原地址）
+        if url_hit_count:
+            all_hits.append(
+                HitStat(
+                    rule_name="超链接目标",
+                    count=url_hit_count,
+                    locations=("超链接目标（rels）",),
+                )
+            )
+
         message = None
         if skipped_paragraphs:
             message = (
-                f"共 {total_paragraphs} 个正文段落，其中 {skipped_paragraphs} 个含换行符/制表符/"
-                f"超链接/域代码等复杂结构，本版已跳过（未脱敏），请人工核查"
+                f"共 {total_paragraphs} 个正文段落，其中 {skipped_paragraphs} 个含域代码/"
+                f"修订标记等复杂结构，本版已跳过（未脱敏），请人工核查"
+            )
+        elif url_hit_count:
+            message = (
+                f"已改写 {url_hit_count} 个 mailto 超链接的目标地址；"
+                f"URL 路径中的其他敏感信息本版不处理"
             )
 
         return FileResult(
@@ -269,11 +303,20 @@ class DocxHandler(BaseHandler):
         """
         paragraph_element = paragraph._p
 
-        # 段落级检查：只接受 pPr + r
+        # 段落级检查：只接受 pPr + r + hyperlink
         if not _is_simple_paragraph(paragraph_element):
             return self._SKIP_COMPLEX
 
-        run_elements = list(paragraph_element.findall(qn("w:r")))
+        # run 元素来源有两处：段落的直接子级，以及 <w:hyperlink> 内部的 run。
+        # **两者都要纳入偏移映射**——否则一个手机号若跨越"普通run / 链接文字"边界，
+        # 拼接时就会缺一段，导致漏脱敏。
+        # 注意用 iter 而非 findall：要取到嵌套在 hyperlink 里的 run。
+        hyperlink_elements = list(paragraph_element.iter(qn("w:hyperlink")))
+        for hyperlink in hyperlink_elements:
+            if not self._is_simple_hyperlink(hyperlink):
+                return self._SKIP_COMPLEX
+
+        run_elements = list(paragraph_element.iter(qn("w:r")))
         if not run_elements:
             return self._SKIP_EMPTY
 
@@ -313,6 +356,19 @@ class DocxHandler(BaseHandler):
             self._apply_matches(segments, matches, engine)
 
         return hits, locations
+
+    @staticmethod
+    def _is_simple_hyperlink(hyperlink_element) -> bool:
+        """判断 ``<w:hyperlink>`` 内部是否只含简单 run。
+
+        只允许 ``w:r``（run）与 ``w:proofErr``（拼写校对标记）等**无文本**元素。
+        域代码、修订标记等仍视为复杂结构。
+        """
+        allowed = {qn("w:r"), qn("w:proofErr"), qn("w:bookmarkStart"), qn("w:bookmarkEnd")}
+        for child in hyperlink_element:
+            if child.tag not in allowed:
+                return False
+        return True
 
     @staticmethod
     def _merge_hits(hits: List[HitStat]) -> List[HitStat]:

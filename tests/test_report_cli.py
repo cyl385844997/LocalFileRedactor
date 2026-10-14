@@ -458,8 +458,23 @@ class TestOfflineGuarantee:
     """离线承诺的机器可验证部分。"""
 
     def test源码不含网络库导入(self):
-        """产品核心承诺是绝不联网——用测试守住这条线。"""
-        banned = ("import requests", "import urllib.request", "import http.client", "import socket", "from urllib")
+        """产品核心承诺是绝不联网——用测试守住这条线。
+
+        注意区分：``urllib.parse`` 是**纯字符串编解码**（quote/unquote/urlparse），
+        实测其模块内不含 socket/urlopen/connect 任何网络能力，可以安全使用
+        （docx_url.py 用它对占位符做 URL 编码）。
+        真正要禁的是 ``urllib.request`` / ``urllib.error`` / ``http`` / ``socket``。
+        """
+        banned = (
+            "import requests",
+            "import urllib.request",
+            "from urllib.request",
+            "from urllib.error",
+            "import http.client",
+            "import socket",
+            "import httpx",
+            "import aiohttp",
+        )
         offenders = []
         for path in (PROJECT_ROOT / "src").rglob("*.py"):
             content = path.read_text(encoding="utf-8")
@@ -467,6 +482,21 @@ class TestOfflineGuarantee:
                 if token in content:
                     offenders.append(f"{path.name}: {token}")
         assert not offenders, f"发现网络相关导入：{offenders}"
+
+    def test_允许的urllib子模块确认无网络能力(self):
+        """``urllib.parse`` 必须在本地按需核验，确保它确实不含网络符号。
+
+        这条测试的价值：万一将来有人把 ``urllib.request`` 的功能混进来，
+        上面的字符串匹配可能漏掉更隐蔽的写法（如 ``__import__``），
+        用真实的模块属性检查兜底。
+        """
+        import urllib.parse
+
+        names = [n for n in dir(urllib.parse) if not n.startswith("_")]
+        network_like = [
+            n for n in names if any(k in n.lower() for k in ("socket", "urlopen", "connect"))
+        ]
+        assert not network_like, f"urllib.parse 出现网络相关符号：{network_like}"
 
     def test依赖中无网络库(self):
         content = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
