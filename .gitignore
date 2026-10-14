@@ -1,0 +1,30 @@
+# 依赖与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 测试样例（合成数据，不入库）
+samples/
+
+# pytest / 工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 运行产物（脱敏输出）
+out/
+redacted_output/
