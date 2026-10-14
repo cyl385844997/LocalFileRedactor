@@ -1,7 +1,12 @@
 """处理器层。
 
-本包按扩展名把文件分派给对应 handler。P0 只有 txt handler，
-P1/P2/P3 会往 REGISTRY 里追加 docx / xlsx / pdf。
+本包按扩展名把文件分派给对应 handler。
+
+阶段进度（一次只做一个 handler）：
+    P0  txt_handler   纯文本
+    P1  docx_handler  Word 正文段落（含跨 run 匹配）
+    P2  xlsx_handler  待实现
+    P3  pdf_handler   待实现
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Type
 
 from redactor.handlers.base import BaseHandler, HandlerError, prepare_output
+from redactor.handlers.docx_handler import DocxHandler
 from redactor.handlers.txt_handler import TxtHandler, read_text_safe
 
 #: 扩展名 -> handler 类
@@ -33,6 +39,7 @@ def _register(handler_cls: Type[BaseHandler]) -> None:
 
 
 _register(TxtHandler)
+_register(DocxHandler)
 
 
 def get_handler(path: str | Path) -> BaseHandler:
@@ -69,6 +76,7 @@ __all__ = [
     "KNOWN_UNSUPPORTED",
     "BaseHandler",
     "HandlerError",
+    "DocxHandler",
     "TxtHandler",
     "read_text_safe",
     "get_handler",

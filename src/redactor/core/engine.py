@@ -67,6 +67,21 @@ class RedactionEngine:
             found.extend(recognizer.find(text))
         return self._replacer.apply(text, found)
 
+    def render_placeholder(self, match: Match) -> str:
+        """取某处命中的占位符文本。
+
+        供handlers 层使用：当handler 需要自行控制替换落点时（例如 docx 要把
+        占位符写进特定的run），仍要复用同一套编号分配逻辑，
+        否则编号模式下会出现编号不一致。
+
+        Args:
+            match: 命中对象（通常来自 :meth:`scan`）。
+
+        Returns:
+            ``[手机号]`` 或编号模式下的 ``[手机号#1]``。
+        """
+        return self._replacer.placeholder_for(match)
+
     @staticmethod
     def aggregate(matches: Iterable[Match], locations: Optional[Dict[Tuple[str, int], str]] = None) -> List[HitStat]:
         """把命中聚合成"规则名 + 次数 + 位置"的统计，**不含任何原文**。

@@ -9,9 +9,14 @@ venv/
 
 # 测试样例（合成数据，不入库）
 samples/
+# 脱敏输出目录（本地跑出来的结果，不入库）
+redacted_output/
+redacted_output*/
+out/
 
 # pytest / 工具缓存
 .pytest_cache/
+.pytest_tmp/
 .coverage
 htmlcov/
 

@@ -140,6 +140,10 @@ class Report:
             for stat in result.hits:
                 loc = f"，位置：{'、'.join(stat.locations)}" if stat.locations else ""
                 lines.append(f"         {stat.placeholder} x {stat.count}{loc}")
+            # 成功但有提示（如 docx 跳过了含复杂结构的段落）同样要展示：
+            # 这类文件状态是"成功"，但存在漏脱敏风险，绝不能因为不是 failed 就被略过
+            if result.status != "failed" and result.message:
+                lines.append(f"         注意：{result.message}")
 
         # 失败与跳过文件单独汇总，方便人工兜底（需求补充约束 A）
         needs_attention = [r for r in self.results if r.status in ("failed", "skipped")]
@@ -149,6 +153,15 @@ class Report:
             for result in needs_attention:
                 label = REASON_LABELS.get(result.reason or "", result.reason or "未知")
                 lines.append(f"  - {result.source}（{label}）")
+
+        # 处理成功但存在"部分未处理"的文件同样需要人工复核：
+        # 状态是成功、内容也有脱敏，但仍有段落因结构复杂被跳过。
+        partial = [r for r in self.results if r.status == "ok" and r.message]
+        if partial:
+            lines.append("")
+            lines.append("处理成功但有未处理内容的文件（需人工复核）：")
+            for result in partial:
+                lines.append(f"  - {result.source}：{result.message}")
 
         lines.append("")
         lines.append("说明：本报告仅记录规则名、命中次数与位置，不含任何被脱敏的原文。")

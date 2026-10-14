@@ -89,6 +89,36 @@ class TestReportContent:
         assert "locked.doc" in text
         assert REASON_LABELS["encrypted_file"] in text
 
+    def test_成功但部分未处理的文件必须提示(self):
+        """回归测试：状态为"成功"但存在跳过段落时，报告必须展示。
+
+        早期版本只在 status == "failed" 时渲染 message，
+        导致 docx 跳过了含复杂结构的段落却毫无提示——
+        漏脱敏风险不可见，等于白做。
+        """
+        report = Report()
+        report.add(
+            FileResult(
+                source="a.docx",
+                status="ok",
+                hits=[HitStat("手机号", 1, ("第 4 段",))],
+                message="共 4 个正文段落，其中 2 个含换行符/制表符等复杂结构，本版已跳过（未脱敏）",
+            )
+        )
+        text = report.to_text()
+
+        assert "未处理" in text
+        assert "需人工复核" in text
+        assert "a.docx" in text
+        assert "本版已跳过" in text
+
+    def test_成功且无提示的文件不产生噪音(self):
+        """没有跳过内容时不应输出多余的"需复核"段落。"""
+        report = Report()
+        report.add(FileResult(source="clean.txt", status="ok", hits=[HitStat("手机号", 1)]))
+        text = report.to_text()
+        assert "需人工复核" not in text
+
     def test_每种原因码都有中文标签(self):
         """防止新增原因码却忘了解释，人工兜底时看不懂。"""
         from redactor.handlers.base import HandlerError
