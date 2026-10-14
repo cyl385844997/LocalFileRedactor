@@ -61,6 +61,10 @@ from docx.text.paragraph import Paragraph
 from redactor.core.engine import RedactionEngine
 from redactor.core.models import FileResult, HitStat, Match
 from redactor.handlers.base import BaseHandler, HandlerError, prepare_output
+from redactor.handlers.docx_headerfooter import (
+    collect_header_footer_items,
+    iter_header_footer_paragraphs,
+)
 from redactor.handlers.docx_table import iter_all_table_paragraphs
 from redactor.handlers.docx_url import redact_hyperlink_targets
 
@@ -218,12 +222,44 @@ class DocxHandler(BaseHandler):
                 f"表格处理中止：{exc}",
             ) from exc
 
+        # ---- 页眉页脚（优先级 4）----
+        # page header/footer 存在独立 part 里，document.paragraphs 不含它们。
+        # "链接到前一节"会让多个节指向同一个 part，因此按 part 去重。
+        hf_skipped = 0
+        hf_paragraphs = 0
+        special_hf_count = 0
+        try:
+            hf_items, _duplicates = collect_header_footer_items(document)
+            special_hf_count = sum(1 for item in hf_items if item.is_special)
+            for paragraph, location in iter_header_footer_paragraphs(document):
+                hf_paragraphs += 1
+                result = self._process_paragraph(
+                    paragraph, location, engine, dry_run=dry_run
+                )
+                if isinstance(result, str):
+                    if result in self._UNSAFE_SKIP:
+                        hf_skipped += 1
+                    continue
+                hf_hits, _ = result
+                if hf_hits:
+                    all_hits.extend(hf_hits)
+        except RecursionError as exc:
+            raise HandlerError(
+                HandlerError.CORRUPTED, f"页眉页脚处理中止：{exc}"
+            ) from exc
+
         # ---- URL 脱敏（rels 文件里的 mailto 链接）----
         # 必须在 document.save() **之前**做：rels 改动随 save 一并写入。
+        # 页眉页脚有各自的 part 与 rels，也要一并处理（实测页眉里确实可能有链接）。
         url_hit_count = 0
         try:
-            url_hits = redact_hyperlink_targets(document.part, engine, dry_run=dry_run)
-            url_hit_count = len(url_hits)
+            url_parts = [document.part]
+            hf_items_for_url, _ = collect_header_footer_items(document)
+            url_parts.extend(item.part for item in hf_items_for_url)
+
+            for part in url_parts:
+                url_hits = redact_hyperlink_targets(part, engine, dry_run=dry_run)
+                url_hit_count += len(url_hits)
         except HandlerError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -266,11 +302,33 @@ class DocxHandler(BaseHandler):
             if table_skipped_cells:
                 table_text += f"（其中 {table_skipped_cells} 个含复杂结构，已跳过未脱敏）"
             parts.append(table_text)
+        if hf_paragraphs:
+            hf_text = f"页眉页脚共 {hf_paragraphs} 个段落"
+            if hf_skipped:
+                hf_text += f"（其中 {hf_skipped} 个含复杂结构，已跳过未脱敏）"
+            parts.append(hf_text)
 
-        if skipped_paragraphs or table_skipped_cells:
+        if skipped_paragraphs or table_skipped_cells or hf_skipped:
             message = "；".join(parts) + "。请人工核查"
+            # 首页/偶数页页眉只有在文档开启对应设置时才生效，
+            # 但内容仍可能被脱敏，故明确告知以免误解"处理了但看不到变化"
+            if special_hf_count:
+                message += (
+                    f"。另检测到 {special_hf_count} 处首页/偶数页页眉页脚，"
+                    f"当前文档可能未开启对应设置，这些内容当前不显示，但已一并脱敏"
+                )
+        elif special_hf_count:
+            message = (
+                f"检测到 {special_hf_count} 处首页/偶数页页眉页脚，"
+                f"当前文档可能未开启对应设置，这些内容当前不显示，但已一并脱敏"
+            )
+        if url_hit_count and message:
+            message += f"。已改写 {url_hit_count} 个 mailto 超链接目标"
         elif url_hit_count:
-            message = f"已改写 {url_hit_count} 个 mailto 超链接的目标地址；URL 路径中的其他敏感信息本版不处理"
+            message = (
+                f"已改写 {url_hit_count} 个 mailto 超链接的目标地址；"
+                f"URL 路径中的其他敏感信息本版不处理"
+            )
 
         return FileResult(
             source=str(source),

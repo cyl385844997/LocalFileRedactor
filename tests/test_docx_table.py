@@ -386,10 +386,11 @@ class TestSecurityBottomLine:
 class TestNotCovered:
     """边界：本轮之外的容器仍未处理，用测试钉住。"""
 
-    def test_页眉页脚未处理(self, engine, samples_dir):
-        """页眉属优先级 4，本轮不处理。"""
+    def test_页眉页脚现已脱敏(self, engine, samples_dir):
+        """回归：P3 时"页眉不处理"是边界，优先级 4 起应正常脱敏。"""
         document = Document()
         section = document.sections[0]
+        section.header.is_linked_to_previous = False
         section.header.paragraphs[0].text = f"页眉电话 {FAKE_PHONE_1}"
         document.add_paragraph("正文")
         source = samples_dir / "header.docx"
@@ -399,4 +400,4 @@ class TestNotCovered:
         DocxHandler().process(source, output, engine)
 
         result = Document(str(output))
-        assert FAKE_PHONE_1 in result.sections[0].header.paragraphs[0].text
+        assert FAKE_PHONE_1 not in result.sections[0].header.paragraphs[0].text

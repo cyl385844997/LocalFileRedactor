@@ -21,6 +21,8 @@
   内部锚点链接、显示文字含邮箱、手机号跨越链接边界
 * ``docx_demo_table.docx``      表格样例：普通表格、合并单元格、
   嵌套表格、单元格内超链接、单元格内域代码
+* ``docx_demo_headerfooter.docx`` 页眉页脚样例：多节、链接到前一节、
+  首页不同、偶数页不同、页眉内表格与超链接
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from pathlib import Path
 from typing import List
 
 from docx import Document
+from docx.enum.section import WD_SECTION
 from docx.enum.text import WD_BREAK
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
@@ -323,6 +326,64 @@ def make_table_sample() -> Path:
     return path
 
 
+def make_headerfooter_sample() -> Path:
+    """生成页眉页脚样例（优先级 4）。
+
+    覆盖六种情形：
+        1. 第1节的默认页眉/ 页脚
+        2. 第2节独立的页眉/页脚
+        3. 第3节"链接到前一节"（内容实际存放在第2节）
+        4. 首页不同（``first_page_header``）
+        5. 偶数页不同（``even_page_header``）
+        6. 页眉内的表格与超链接
+    """
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLES_DIR / "docx_demo_headerfooter.docx"
+
+    document = Document()
+
+    # 第1节：默认页眉页脚
+    section1 = document.sections[0]
+    section1.header.is_linked_to_previous = False
+    section1.header.paragraphs[0].text = f"第1节页眉电话 {FAKE_PHONE_1}"
+    section1.footer.is_linked_to_previous = False
+    section1.footer.paragraphs[0].text = f"第1节页脚邮箱 {FAKE_EMAIL}"
+
+    # 第2节：独立页眉页脚
+    section2 = document.add_section(WD_SECTION.NEW_PAGE)
+    section2.header.is_linked_to_previous = False
+    section2.header.paragraphs[0].text = f"第2节页眉身份证 {FAKE_ID_VALID}"
+    section2.footer.is_linked_to_previous = False
+    section2.footer.paragraphs[0].text = "第2节页脚无敏感信息"
+
+    # 第3节：保持"链接到前一节"，不单独设置内容
+    document.add_section(WD_SECTION.NEW_PAGE)
+
+    # 首页不同
+    # 注意：python-docx 会把首页/偶数页引用写进 body 末尾的 sectPr，
+    # 所以这里设置在第1节，实际存储位置可能显示为最后一节——
+    # 这不影响功能，标签按真实 sectPr 位置生成。
+    section1.different_first_page_header_footer = True
+    section1.first_page_header.is_linked_to_previous = False
+    section1.first_page_header.paragraphs[0].text = f"首页页眉 {FAKE_IP}"
+
+    # 偶数页不同
+    section1.even_page_header.is_linked_to_previous = False
+    section1.even_page_header.paragraphs[0].text = f"偶数页页眉 {FAKE_BANK_CARD}"
+
+    # 页眉内放表格
+    header_table = section1.header.add_table(rows=1, cols=1, width=2000)
+    header_table.cell(0, 0).text = f"页眉表格内 {FAKE_PHONE_2}"
+
+    # 页眉内放超链接
+    link_paragraph = section1.header.add_paragraph()
+    add_hyperlink(link_paragraph, f"mailto:{FAKE_EMAIL}", "页眉邮件链接")
+
+    document.add_paragraph("正文段落")
+    document.save(str(path))
+    return path
+
+
 def build_all() -> List[Path]:
     """生成全部 docx 样例。"""
     return [
@@ -331,6 +392,7 @@ def build_all() -> List[Path]:
         make_complex_sample(),
         make_hyperlink_sample(),
         make_table_sample(),
+        make_headerfooter_sample(),
     ]
 
 
