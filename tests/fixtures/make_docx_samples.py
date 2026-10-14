@@ -23,6 +23,7 @@
   嵌套表格、单元格内超链接、单元格内域代码
 * ``docx_demo_headerfooter.docx`` 页眉页脚样例：多节、链接到前一节、
   首页不同、偶数页不同、页眉内表格与超链接
+* ``docx_demo_comment.docx``批注样例：批注含敏感信息、无敏感信息、多段落
 """
 
 from __future__ import annotations
@@ -384,6 +385,89 @@ def make_headerfooter_sample() -> Path:
     return path
 
 
+def attach_comments(document, comments) -> None:
+    """给文档挂上批注（python-docx 无此 API，手工构造）。
+
+    Args:
+        document: 目标 Document。
+        comments: 列表，每项 ``(comment_id, author, initials, text)``。
+    """
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.opc.packuri import PackURI
+    from docx.opc.part import Part
+
+    entries = []
+    for comment_id, author, initials, text in comments:
+        entries.append(
+            f'<w:comment w:id="{comment_id}" w:author="{author}" '
+            f'w:initials="{initials}" w:date="2026-01-01T00:00:00Z">'
+            f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:comment>"
+        )
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:comments xmlns:w="http://schemas.openxmlformats.org/'
+        'wordprocessingml/2006/main">' + "".join(entries) + "</w:comments>"
+    )
+    part = Part(
+        PackURI("/word/comments.xml"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+        xml.encode("utf-8"),
+        document.part.package,
+    )
+    document.part.relate_to(part, RT.COMMENTS)
+
+    # 正文侧建立引用锚点
+    paragraph = document.add_paragraph()
+    for comment_id, *_ in comments:
+        start = OxmlElement("w:commentRangeStart")
+        start.set(qn("w:id"), str(comment_id))
+        paragraph._p.insert(0, start)
+
+    for comment_id, *_ in comments:
+        end = OxmlElement("w:commentRangeEnd")
+        end.set(qn("w:id"), str(comment_id))
+        paragraph._p.append(end)
+        run = OxmlElement("w:r")
+        rpr = OxmlElement("w:rPr")
+        style = OxmlElement("w:rStyle")
+        style.set(qn("w:val"), "CommentReference")
+        rpr.append(style)
+        run.append(rpr)
+        ref = OxmlElement("w:commentReference")
+        ref.set(qn("w:id"), str(comment_id))
+        run.append(ref)
+        paragraph._p.append(run)
+
+
+def make_comment_sample() -> Path:
+    """生成批注样例（优先级 5）。
+
+    覆盖三种情形：
+        1. 批注正文含敏感信息（应脱敏）
+        2. 批注正文无敏感信息（不应改动）
+        3. 同一条批注含多个段落（验证逐段处理）
+    """
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLES_DIR / "docx_demo_comment.docx"
+
+    document = Document()
+    document.add_heading("Word 批注脱敏样例（合成数据）", level=1)
+    document.add_paragraph("正文段落，批注挂在这一段。")
+
+    attach_comments(
+        document,
+        [
+            (1, "张三", "ZS", f"批注含手机号 {FAKE_PHONE_1} 和邮箱 {FAKE_EMAIL}"),
+            (2, "李四", "LS", "这条批注不含任何敏感信息"),
+            (3, "王五", "WW", f"身份证 {FAKE_ID_VALID}"),
+        ],
+    )
+
+    document.save(str(path))
+    return path
+
+
 def build_all() -> List[Path]:
     """生成全部 docx 样例。"""
     return [
@@ -393,6 +477,7 @@ def build_all() -> List[Path]:
         make_hyperlink_sample(),
         make_table_sample(),
         make_headerfooter_sample(),
+        make_comment_sample(),
     ]
 
 

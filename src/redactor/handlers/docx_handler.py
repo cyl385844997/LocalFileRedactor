@@ -61,6 +61,7 @@ from docx.text.paragraph import Paragraph
 from redactor.core.engine import RedactionEngine
 from redactor.core.models import FileResult, HitStat, Match
 from redactor.handlers.base import BaseHandler, HandlerError, prepare_output
+from redactor.handlers.docx_comments import count_comments, iter_comment_paragraphs
 from redactor.handlers.docx_headerfooter import (
     collect_header_footer_items,
     iter_header_footer_paragraphs,
@@ -80,11 +81,34 @@ from redactor.handlers.docx_url import redact_hyperlink_targets
 # 它们只是占位用于对齐偏移，替换时对应的 ``<w:br/>`` / ``<w:tab/>`` 元素原样保留。
 # ---------------------------------------------------------------------------
 
-#: run 内允许存在的子元素：格式、纯文本、换行符、制表符
-_ALLOWED_RUN_CHILDREN = {qn("w:rPr"), qn("w:t"), qn("w:br"), qn("w:tab"), qn("w:cr")}
+#: run 内允许存在的子元素：格式、纯文本、换行符、制表符、批注引用
+#:
+#: ``w:commentReference`` 在正文里被包在 ``<w:r>`` 内（实测），它是**无文本**的
+#: 标记元素，不占偏移、不影响匹配，必须放行，否则带批注的正文段落会被整段跳过。
+_ALLOWED_RUN_CHILDREN = {
+    qn("w:rPr"),
+    qn("w:t"),
+    qn("w:br"),
+    qn("w:tab"),
+    qn("w:cr"),
+    qn("w:commentReference"),
+}
 
-#: 段落内允许存在的子元素：段落属性、run、超链接
-_ALLOWED_PARAGRAPH_CHILDREN = {qn("w:pPr"), qn("w:r"), qn("w:hyperlink")}
+#: 段落内允许存在的子元素：段落属性、run、超链接、批注范围标记
+#:
+#: ``w:commentRangeStart`` / ``w:commentRangeEnd`` 是**空元素**（实测无任何子节点），
+#: 与 ``<w:br/>`` / ``<w:tab/>`` 不同——**它们不占偏移**，仅标记批注范围。
+#: 若不放行，真实文档里所有带批注的段落都会因"复杂结构"被跳过，造成漏脱敏。
+#:
+#: 注意：``w:proofErr``（拼写校对标记）与 ``w:bookmarkStart`` / ``w:bookmarkEnd``
+#: 同样是空元素，但本轮**未纳入**——超出修复范围，应单独评估后再决定。
+_ALLOWED_PARAGRAPH_CHILDREN = {
+    qn("w:pPr"),
+    qn("w:r"),
+    qn("w:hyperlink"),
+    qn("w:commentRangeStart"),
+    qn("w:commentRangeEnd"),
+}
 
 #: 视为"占一个字符"的元素 -> 该占位字符
 _SPECIAL_CHARS = {qn("w:br"): "\n", qn("w:cr"): "\n", qn("w:tab"): "\t"}
@@ -248,6 +272,26 @@ class DocxHandler(BaseHandler):
                 HandlerError.CORRUPTED, f"页眉页脚处理中止：{exc}"
             ) from exc
 
+        # ---- 批注（优先级 5）----
+        # 批注存在独立的 comments.xml part，document.paragraphs 不含它们。
+        # 只改批注段落里的 <w:t> 文本，绝不碰 w:id —— 正文侧的
+        # commentRangeStart/End 与 commentReference 全部依赖该 id。
+        # 作者名（w:author/w:initials）保持原样，见 docx_comments 模块说明。
+        comment_skipped = 0
+        comment_paragraphs = 0
+        for paragraph, location in iter_comment_paragraphs(document):
+            comment_paragraphs += 1
+            result = self._process_paragraph(
+                paragraph, location, engine, dry_run=dry_run
+            )
+            if isinstance(result, str):
+                if result in self._UNSAFE_SKIP:
+                    comment_skipped += 1
+                continue
+            comment_hits, _ = result
+            if comment_hits:
+                all_hits.extend(comment_hits)
+
         # ---- URL 脱敏（rels 文件里的 mailto 链接）----
         # 必须在 document.save() **之前**做：rels 改动随 save 一并写入。
         # 页眉页脚有各自的 part 与 rels，也要一并处理（实测页眉里确实可能有链接）。
@@ -307,8 +351,19 @@ class DocxHandler(BaseHandler):
             if hf_skipped:
                 hf_text += f"（其中 {hf_skipped} 个含复杂结构，已跳过未脱敏）"
             parts.append(hf_text)
+        if comment_paragraphs:
+            comment_total = count_comments(document)
+            comment_text = f"{comment_total} 条批注共 {comment_paragraphs} 个段落"
+            if comment_skipped:
+                comment_text += f"（其中 {comment_skipped} 个含复杂结构，已跳过未脱敏）"
+            parts.append(comment_text)
 
-        if skipped_paragraphs or table_skipped_cells or hf_skipped:
+        if (
+            skipped_paragraphs
+            or table_skipped_cells
+            or hf_skipped
+            or comment_skipped
+        ):
             message = "；".join(parts) + "。请人工核查"
             # 首页/偶数页页眉只有在文档开启对应设置时才生效，
             # 但内容仍可能被脱敏，故明确告知以免误解"处理了但看不到变化"
