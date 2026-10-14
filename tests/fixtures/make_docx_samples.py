@@ -17,8 +17,10 @@
 * ``docx_demo_single_run.docx``   手机号完整落在单个 run 内（对照组）
 * ``docx_demo_complex.docx``      含 ``<w:br/>`` 与 ``<w:tab/>`` 的复杂段落，
   用于验证 br/tab 现在能被正常处理且元素不被破坏
-* ``docx_demo_hyperlink.docx``     超链接样例：mailto 链接、https 链接、
+* ``docx_demo_hyperlink.docx``超链接样例：mailto 链接、https 链接、
   内部锚点链接、显示文字含邮箱、手机号跨越链接边界
+* ``docx_demo_table.docx``      表格样例：普通表格、合并单元格、
+  嵌套表格、单元格内超链接、单元格内域代码
 """
 
 from __future__ import annotations
@@ -255,6 +257,72 @@ def make_hyperlink_sample() -> Path:
     return path
 
 
+def make_table_sample() -> Path:
+    """生成表格样例（优先级 3）。
+
+    覆盖五种情形：
+        1. 普通表格（多行多列，含多类敏感信息）
+        2. 合并单元格（同一 XML 元素被多个坐标指向）
+        3. 嵌套表格（外格内再放一个表）
+        4. 单元格内含超链接
+        5. 单元格内含域代码（本版应跳过该段落）
+    """
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLES_DIR / "docx_demo_table.docx"
+
+    document = Document()
+    document.add_heading("Word 表格脱敏样例（合成数据）", level=1)
+
+    # 情形 1：普通表格
+    table = document.add_table(rows=2, cols=3)
+    table.cell(0, 0).text = f"联系人 {FAKE_PHONE_1}"
+    table.cell(0, 1).text = f"邮箱 {FAKE_EMAIL}"
+    table.cell(0, 2).text = "无敏感信息"
+    table.cell(1, 0).text = f"身份证 {FAKE_ID_VALID}"
+    table.cell(1, 1).text = f"银行卡 {FAKE_BANK_CARD}"
+    table.cell(1, 2).text = f"服务器 {FAKE_IP}"
+    # 在已有单元格里再加一段，验证"单元格内多段落"也被处理
+    # 注意：要用 add_paragraph 的那个单元格不能是合并格，
+    # 否则 python-docx 的 cell 代理会让相邻坐标指向同一元素、内容互相覆盖。
+    table.cell(1, 2).add_paragraph(f"第二段 {FAKE_PHONE_2}")
+
+    # 情形 2：合并单元格
+    merged = document.add_table(rows=2, cols=2)
+    merged.cell(0, 0).merge(merged.cell(0, 1))
+    merged.cell(0, 0).text = f"合并单元格 {FAKE_BANK_CARD}"
+    merged.cell(1, 0).text = "A"
+    merged.cell(1, 1).text = "B"
+
+    # 情形 3：嵌套表格
+    nested = document.add_table(rows=1, cols=1)
+    outer_cell = nested.cell(0, 0)
+    outer_cell.text = "外层单元格"
+    inner = outer_cell.add_table(rows=1, cols=1)
+    inner.cell(0, 0).text = f"嵌套表内 {FAKE_IP}"
+
+    # 情形 4：单元格内超链接
+    linked = document.add_table(rows=1, cols=1)
+    add_hyperlink(linked.cell(0, 0).paragraphs[0], f"mailto:{FAKE_EMAIL}", "邮件链接")
+
+    # 情形 5：单元格内含域代码（本版该段落应被跳过）
+    field = document.add_table(rows=1, cols=1)
+    field_paragraph = field.cell(0, 0).paragraphs[0]
+    field_paragraph.add_run("页码附近")
+    run_begin = OxmlElement("w:r")
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    run_begin.append(fld_begin)
+    field_paragraph._p.append(run_begin)
+    run_instr = OxmlElement("w:r")
+    instr = OxmlElement("w:instrText")
+    instr.text = " PAGE "
+    run_instr.append(instr)
+    field_paragraph._p.append(run_instr)
+
+    document.save(str(path))
+    return path
+
+
 def build_all() -> List[Path]:
     """生成全部 docx 样例。"""
     return [
@@ -262,6 +330,7 @@ def build_all() -> List[Path]:
         make_single_run_sample(),
         make_complex_sample(),
         make_hyperlink_sample(),
+        make_table_sample(),
     ]
 
 

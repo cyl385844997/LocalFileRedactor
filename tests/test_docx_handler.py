@@ -725,13 +725,12 @@ class TestRegistry:
 class TestNoTableProcessing:
     """P1 第一版明确不处理表格——本组用例把这个边界钉死，避免误以为已覆盖。"""
 
-    def test_表格内暂不脱敏(self, engine, samples_dir):
-        """表格内容本版**故意不处理**，此断言锁住该边界。
+    def test_表格内现已脱敏(self, engine, samples_dir):
+        """回归：P1/P2 时"表格不处理"是边界，优先级 3 起应正常脱敏。
 
-        顺带验证了 python-docx 的一个关键行为：
+        同时锁定一个 python-docx 事实：
         ``document.paragraphs`` **不包含表格内的段落**，
-        所以表格内容天然落在本版处理范围之外——这也解释了
-        为什么表格里的号码会原样保留。
+        所以表格必须靠独立遍历才能覆盖。
         """
         document = Document()
         table = document.add_table(rows=1, cols=1)
@@ -744,7 +743,6 @@ class TestNoTableProcessing:
         DocxHandler().process(source, output, engine)
         result = Document(str(output))
 
-        # 表格内容未被处理
-        assert result.tables[0].cell(0, 0).text == f"表格内手机 {FAKE_PHONE_1}"
-        # 且 document.paragraphs 里确实不含表格段落（这是边界成立的原因）
+        assert result.tables[0].cell(0, 0).text == "表格内手机 [手机号]"
+        # 确认 document.paragraphs 确实看不到表格内容（说明必须独立遍历）
         assert all(FAKE_PHONE_1 not in p.text for p in result.paragraphs)

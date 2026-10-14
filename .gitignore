@@ -14,6 +14,10 @@ redacted_output/
 redacted_output*/
 out/
 
+# 探测目录（开发期临时产物，一律不入库）
+*_probe/
+probe/
+
 # pytest / 工具缓存
 .pytest_cache/
 .pytest_tmp/
@@ -29,7 +33,3 @@ htmlcov/
 Thumbs.db
 desktop.ini
 .DS_Store
-
-# 运行产物（脱敏输出）
-out/
-redacted_output/

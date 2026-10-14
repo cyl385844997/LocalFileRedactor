@@ -61,6 +61,7 @@ from docx.text.paragraph import Paragraph
 from redactor.core.engine import RedactionEngine
 from redactor.core.models import FileResult, HitStat, Match
 from redactor.handlers.base import BaseHandler, HandlerError, prepare_output
+from redactor.handlers.docx_table import iter_all_table_paragraphs
 from redactor.handlers.docx_url import redact_hyperlink_targets
 
 # ---------------------------------------------------------------------------
@@ -179,7 +180,7 @@ class DocxHandler(BaseHandler):
 
         for index, paragraph in enumerate(document.paragraphs, start=1):
             total_paragraphs += 1
-            result = self._process_paragraph(paragraph, index, engine, dry_run=dry_run)
+            result = self._process_paragraph(paragraph, f"第 {index} 段", engine, dry_run=dry_run)
 
             # 只把"因结构复杂而无法可靠处理"的段落计入未处理。
             # "无命中""空段落"是正常情况，若也算进去会让报告谎报漏脱敏风险。
@@ -191,6 +192,31 @@ class DocxHandler(BaseHandler):
             hits, locations = result
             if hits:
                 all_hits.extend(hits)
+
+        # ---- 表格内段落（优先级 3）----
+        # document.paragraphs 不含表格内段落，必须单独遍历；
+        # 嵌套表格递归处理、合并单元格按 XML 元素去重（见 docx_table 模块）。
+        table_skipped_cells = 0
+        table_cells = 0
+        try:
+            for paragraph, location in iter_all_table_paragraphs(document):
+                table_cells += 1
+                result = self._process_paragraph(
+                    paragraph, location, engine, dry_run=dry_run
+                )
+                if isinstance(result, str):
+                    if result in self._UNSAFE_SKIP:
+                        table_skipped_cells += 1
+                    continue
+                cell_hits, _ = result
+                if cell_hits:
+                    all_hits.extend(cell_hits)
+        except RecursionError as exc:
+            # 嵌套过深：跳过剩余表格但明确告知，不静默
+            raise HandlerError(
+                HandlerError.CORRUPTED,
+                f"表格处理中止：{exc}",
+            ) from exc
 
         # ---- URL 脱敏（rels 文件里的 mailto 链接）----
         # 必须在 document.save() **之前**做：rels 改动随 save 一并写入。
@@ -227,16 +253,24 @@ class DocxHandler(BaseHandler):
             )
 
         message = None
-        if skipped_paragraphs:
-            message = (
-                f"共 {total_paragraphs} 个正文段落，其中 {skipped_paragraphs} 个含域代码/"
-                f"修订标记等复杂结构，本版已跳过（未脱敏），请人工核查"
-            )
+        # 正文与表格分开计数：位置标签已能区分（第 N 段 / 表N RXCY），
+        # 但汇总数字必须分开，否则无法判断漏脱敏集中在哪。
+        parts = []
+        if total_paragraphs:
+            body_text = f"共 {total_paragraphs} 个正文段落"
+            if skipped_paragraphs:
+                body_text += f"（其中 {skipped_paragraphs} 个含域代码/修订标记等复杂结构，已跳过未脱敏）"
+            parts.append(body_text)
+        if table_cells:
+            table_text = f"{len(document.tables)} 个表格共 {table_cells} 个单元格段落"
+            if table_skipped_cells:
+                table_text += f"（其中 {table_skipped_cells} 个含复杂结构，已跳过未脱敏）"
+            parts.append(table_text)
+
+        if skipped_paragraphs or table_skipped_cells:
+            message = "；".join(parts) + "。请人工核查"
         elif url_hit_count:
-            message = (
-                f"已改写 {url_hit_count} 个 mailto 超链接的目标地址；"
-                f"URL 路径中的其他敏感信息本版不处理"
-            )
+            message = f"已改写 {url_hit_count} 个 mailto 超链接的目标地址；URL 路径中的其他敏感信息本版不处理"
 
         return FileResult(
             source=str(source),
@@ -275,30 +309,31 @@ class DocxHandler(BaseHandler):
     def _process_paragraph(
         self,
         paragraph: Paragraph,
-        index: int,
+        location: str,
         engine: RedactionEngine,
         *,
         dry_run: bool,
     ) -> object:
-        """处理单个正文段落。
+        """处理单个段落（正文段落或表格内段落共用）。
 
         Args:
             paragraph: 段落对象。
-            index: 段序号（从 1 开始），用于报告位置。
+            location: 报告用的位置标签。正文传 ``"第 3 段"``，
+                表格内传 ``"表1 R2C3"``（见 :mod:`docx_table`）。
             engine: 脱敏引擎。
             dry_run: True 时不修改 XML。
 
         Returns:
             ``(命中统计, 位置映射)``。
 
-            **返回 ``None`` 表示三种不同情形**，调用方必须区分，
+            **返回字符串表示"无需返回命中"**，调用方必须区分，
             否则报告会把"无需处理"谎报成"无法处理"：
 
             * :attr:`_SKIP_COMPLEX`  段落含复杂结构，**本版无法可靠脱敏**（漏脱敏风险）
             * :attr:`_SKIP_NO_MATCH` 段落是纯 run 结构但没有命中（无需处理，正常）
             * :attr:`_SKIP_EMPTY`    段落无 run 或全为空白（无需处理，正常）
 
-        位置映射形如 ``{("手机号", 起始偏移): "第 3 段"}``，
+        位置映射形如 ``{("手机号", 起始偏移): "表1 R2C3"}``，
         其中偏移是**段落内偏移**，与 :meth:`RedactionEngine.aggregate` 的约定一致。
         """
         paragraph_element = paragraph._p
@@ -348,8 +383,8 @@ class DocxHandler(BaseHandler):
         locations: Dict[Tuple[str, int], str] = {}
         hits: List[HitStat] = []
         for match in matches:
-            locations[(match.rule_name, match.start)] = f"第 {index} 段"
-            hits.append(HitStat(rule_name=match.rule_name, count=1, locations=(f"第 {index} 段",)))
+            locations[(match.rule_name, match.start)] = location
+            hits.append(HitStat(rule_name=match.rule_name, count=1, locations=(location,)))
 
         # ---- 4. 一次性重写（先算清所有影响，再落盘）----
         if not dry_run:

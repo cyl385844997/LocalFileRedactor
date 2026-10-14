@@ -374,8 +374,8 @@ class TestSecurityBottomLine:
 class TestNoOtherContainers:
     """边界：优先级 3-6 的范围本轮不动，用测试钉住。"""
 
-    def test_表格仍未处理(self, engine, samples_dir):
-        """表格属优先级 3，本轮不处理——锁住该边界。"""
+    def test_表格内也已处理(self, engine, samples_dir):
+        """表格已在优先级 3 支持，表格内邮件链接的Target 也应被改写。"""
         document = Document()
         table = document.add_table(rows=1, cols=1)
         table.cell(0, 0).text = f"表格内手机 {FAKE_PHONE_1}"
@@ -387,7 +387,7 @@ class TestNoOtherContainers:
         DocxHandler().process(source, output, engine)
 
         result = Document(str(output))
-        assert result.tables[0].cell(0, 0).text == f"表格内手机 {FAKE_PHONE_1}"
+        assert result.tables[0].cell(0, 0).text == "表格内手机 [手机号]"
 
     def test_非mailto链接不计入跳过(self, engine, samples_dir):
         """https 超链接段落现在应正常处理，不该再被跳过。"""
