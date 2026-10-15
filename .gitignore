@@ -21,6 +21,8 @@ probe/
 # pytest / 工具缓存
 .pytest_cache/
 .pytest_tmp/
+# pytest --basetemp 自定义目录（本项目测试用 .pt_* 命名）
+.pt_*/
 .coverage
 htmlcov/
 

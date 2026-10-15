@@ -468,6 +468,188 @@ def make_comment_sample() -> Path:
     return path
 
 
+def make_textbox_note_sample() -> Path:
+    """生成文本框 + 脚注/尾注样例（优先级 6）。
+
+    覆盖：
+        1. 外层段落同时含**普通文本**与**文本框**（两处都要处理）
+        2. 文本框嵌套文本框
+        3. 脚注与尾注（正文带引用标记）
+        4. 正文段落里含脚注引用标记（验证不因标记而整段跳过）
+    """
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLES_DIR / "docx_demo_textbox_note.docx"
+
+    document = Document()
+    document.add_heading("Word 文本框/脚注尾注样例（合成数据）", level=1)
+
+    # 外层段落：普通文本 + 文本框
+    outer = document.add_paragraph()
+    outer.add_run(f"外层正文电话 {FAKE_PHONE_1}")
+    outer._p.append(_make_textbox(f"文本框内邮箱 {FAKE_EMAIL}"))
+
+    # 嵌套文本框
+    nested_outer = document.add_paragraph()
+    inner_txbx = _make_textbox("外层文本框")
+    inner_para = OxmlElement("w:p")
+    inner_run = OxmlElement("w:r")
+    inner_text = OxmlElement("w:t")
+    inner_text.text = f"嵌套文本框身份证 {FAKE_ID_VALID}"
+    inner_run.append(inner_text)
+    inner_para.append(inner_run)
+    inner_txbx.append(inner_para)
+    nested_outer._p.append(inner_txbx)
+
+    # 脚注与尾注
+    note_paragraph = document.add_paragraph("正文带脚注与尾注引用")
+    _attach_note_ref(note_paragraph, "footnoteReference", "2")
+    _attach_note_ref(note_paragraph, "endnoteReference", "2")
+
+    _attach_notes(
+        document,
+        footnotes=[(2, f"脚注内容手机 {FAKE_PHONE_2}")],
+        endnotes=[(2, f"尾注内容银行卡 {FAKE_BANK_CARD}")],
+    )
+
+    document.save(str(path))
+    return path
+
+
+def _make_textbox(text: str):
+    """构造一个 ``<w:txbxContent>`` 元素（内含一个段落）。"""
+    txbx = OxmlElement("w:txbxContent")
+    paragraph = OxmlElement("w:p")
+    run = OxmlElement("w:r")
+    text_element = OxmlElement("w:t")
+    text_element.text = text
+    run.append(text_element)
+    paragraph.append(run)
+    txbx.append(paragraph)
+    return txbx
+
+
+def _attach_note_ref(paragraph, tag: str, note_id: str) -> None:
+    """在段落末尾插入脚注/尾注引用标记。
+
+    Args:
+        paragraph: 目标段落。
+        tag: ``"footnoteReference"`` 或 ``"endnoteReference"``（不带命名空间前缀）。
+        note_id: 关联的脚注/尾注 id。
+    """
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    style = OxmlElement("w:rStyle")
+    style.set(qn("w:val"), "FootnoteReference")
+    rpr.append(style)
+    run.append(rpr)
+    ref = OxmlElement(f"w:{tag}")
+    ref.set(qn("w:id"), note_id)
+    run.append(ref)
+    paragraph._p.append(run)
+
+
+def _attach_notes(document, footnotes, endnotes) -> None:
+    """挂载脚注/尾注 part（含系统保留条目，验证不会被误处理）。"""
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.opc.packuri import PackURI
+    from docx.opc.part import Part
+
+    ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    )
+
+    def build(root_tag: str, item_tag: str, items, reserved_types) -> bytes:
+        """构造脚注/尾注 part 的 XML。
+
+        注意根元素是**复数**（``w:footnotes`` / ``w:endnotes``），
+        条目才是单数（``w:footnote`` / ``w:endnote``）——
+        两者差一个 s，写错 Word 会打不开。
+        """
+        parts = [
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f"<w:{root_tag} {ns}>"
+        ]
+        for type_name, type_id in reserved_types:
+            parts.append(
+                f'<w:{item_tag} w:type="{type_name}" w:id="{type_id}">'
+                f"<w:p><w:r><w:t></w:t></w:r></w:p></w:{item_tag}>"
+            )
+        for note_id, text in items:
+            parts.append(
+                f'<w:{item_tag} w:id="{note_id}">'
+                f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:{item_tag}>"
+            )
+        parts.append(f"</w:{root_tag}>")
+        return "".join(parts).encode("utf-8")
+
+    reserved = [("separator", "-1"), ("continuationSeparator", "0")]
+    footers_part = Part(
+        PackURI("/word/footnotes.xml"),
+        "application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.footnotes+xml",
+        build("footnotes", "footnote", footnotes, reserved),
+        document.part.package,
+    )
+    endnotes_part = Part(
+        PackURI("/word/endnotes.xml"),
+        "application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.endnotes+xml",
+        build("endnotes", "endnote", endnotes, reserved),
+        document.part.package,
+    )
+    document.part.relate_to(footers_part, RT.FOOTNOTES)
+    document.part.relate_to(endnotes_part, RT.ENDNOTES)
+
+
+def make_prooferr_bookmark_sample() -> Path:
+    """生成含拼写校对标记与书签的样例（真实文档最常见的两种标记）。
+
+    Word 默认会自动插入 ``<w:proofErr>``（拼写/语法校对），
+    几乎所有人工编辑过的文档都有；``_GoBack`` 书签同理。
+    这类元素是**空元素、不占偏移**，放行它们才能避免整段被跳过。
+    """
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLES_DIR / "docx_demo_marker.docx"
+
+    document = Document()
+    document.add_heading("Word 校对标记与书签样例（合成数据）", level=1)
+
+    # 拼写校对标记包裹的段落
+    paragraph = document.add_paragraph()
+    spell_start = OxmlElement("w:proofErr")
+    spell_start.set(qn("w:type"), "spellStart")
+    paragraph._p.append(spell_start)
+
+    run = OxmlElement("w:r")
+    text = OxmlElement("w:t")
+    text.text = f"联系电话 {FAKE_PHONE_1}"
+    run.append(text)
+    paragraph._p.append(run)
+
+    spell_end = OxmlElement("w:proofErr")
+    spell_end.set(qn("w:type"), "spellEnd")
+    paragraph._p.append(spell_end)
+
+    # 书签包裹的段落
+    bookmark_start = OxmlElement("w:bookmarkStart")
+    bookmark_start.set(qn("w:id"), "0")
+    bookmark_start.set(qn("w:name"), "_GoBack")
+    paragraph._p.append(bookmark_start)
+
+    run2 = OxmlElement("w:r")
+    text2 = OxmlElement("w:t")
+    text2.text = f"，邮箱 {FAKE_EMAIL}"
+    run2.append(text2)
+    paragraph._p.append(run2)
+
+    bookmark_end = OxmlElement("w:bookmarkEnd")
+    bookmark_end.set(qn("w:id"), "0")
+    paragraph._p.append(bookmark_end)
+
+    document.save(str(path))
+    return path
+
+
 def build_all() -> List[Path]:
     """生成全部 docx 样例。"""
     return [
@@ -478,6 +660,8 @@ def build_all() -> List[Path]:
         make_table_sample(),
         make_headerfooter_sample(),
         make_comment_sample(),
+        make_textbox_note_sample(),
+        make_prooferr_bookmark_sample(),
     ]
 
 

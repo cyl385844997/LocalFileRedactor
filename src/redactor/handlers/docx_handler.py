@@ -67,6 +67,12 @@ from redactor.handlers.docx_headerfooter import (
     iter_header_footer_paragraphs,
 )
 from redactor.handlers.docx_table import iter_all_table_paragraphs
+from redactor.handlers.docx_textbox import (
+    commit_note_part,
+    get_note_part,
+    iter_note_paragraphs,
+    iter_textbox_paragraphs,
+)
 from redactor.handlers.docx_url import redact_hyperlink_targets
 
 # ---------------------------------------------------------------------------
@@ -81,10 +87,11 @@ from redactor.handlers.docx_url import redact_hyperlink_targets
 # 它们只是占位用于对齐偏移，替换时对应的 ``<w:br/>`` / ``<w:tab/>`` 元素原样保留。
 # ---------------------------------------------------------------------------
 
-#: run 内允许存在的子元素：格式、纯文本、换行符、制表符、批注引用
+#: run 内允许存在的子元素：格式、纯文本、换行符、制表符、脚注/尾注/批注引用
 #:
-#: ``w:commentReference`` 在正文里被包在 ``<w:r>`` 内（实测），它是**无文本**的
-#: 标记元素，不占偏移、不影响匹配，必须放行，否则带批注的正文段落会被整段跳过。
+#: 这些 ``*Reference`` 都是**无文本**的标记元素，不占偏移、不影响匹配，
+#: 必须放行——否则带脚注/尾注/批注的段落会被整段跳过，造成漏脱敏。
+#: 实测它们都被包在 ``<w:r>`` 内，且没有任何文本子节点。
 _ALLOWED_RUN_CHILDREN = {
     qn("w:rPr"),
     qn("w:t"),
@@ -92,22 +99,38 @@ _ALLOWED_RUN_CHILDREN = {
     qn("w:tab"),
     qn("w:cr"),
     qn("w:commentReference"),
+    qn("w:footnoteReference"),
+    qn("w:endnoteReference"),
 }
 
-#: 段落内允许存在的子元素：段落属性、run、超链接、批注范围标记
+#: 段落内允许存在的子元素
 #:
-#: ``w:commentRangeStart`` / ``w:commentRangeEnd`` 是**空元素**（实测无任何子节点），
-#: 与 ``<w:br/>`` / ``<w:tab/>`` 不同——**它们不占偏移**，仅标记批注范围。
-#: 若不放行，真实文档里所有带批注的段落都会因"复杂结构"被跳过，造成漏脱敏。
+#: 下面这些标记元素全部是**空元素、无文本子节点、不占偏移**
+#: （实测：``proofErr`` 只有 ``w:type`` 属性；``bookmarkStart`` 只有
+#: ``w:id`` / ``w:name``；批注标记只有 ``w:id``），
+#: 因此放行它们**不会引入错位风险**，却能避免整段被跳过：
 #:
-#: 注意：``w:proofErr``（拼写校对标记）与 ``w:bookmarkStart`` / ``w:bookmarkEnd``
-#: 同样是空元素，但本轮**未纳入**——超出修复范围，应单独评估后再决定。
+#: * ``w:proofErr`` —— 拼写/语法校对标记。**Word 默认会自动插入**，
+#:   几乎所有人工编辑过的文档都有；不放行会让大量段落正文漏脱敏。
+#: * ``w:bookmarkStart`` / ``w:bookmarkEnd`` —— 书签边界（含 ``_GoBack``）。
+#: * ``w:commentRangeStart`` / ``w:commentRangeEnd`` —— 批注范围。
+#: * ``w:txbxContent`` —— 文本框容器，内部段落由 :mod:`docx_textbox` 独立遍历。
+#:
+#: 与 ``<w:br/>`` / ``<w:tab/>`` 的区别：后两者在文本流里**各占 1 个字符**、
+#: 参与偏移映射；上面这些**完全不占偏移**。
+#:
+#: 仍然会被拦下的（有意为之）：域代码（``w:fldChar`` / ``w:instrText``）、
+#: 修订标记、图形对象、OLE 对象等——它们的内容不可靠，宁可漏也不错位。
 _ALLOWED_PARAGRAPH_CHILDREN = {
     qn("w:pPr"),
     qn("w:r"),
     qn("w:hyperlink"),
+    qn("w:proofErr"),
+    qn("w:bookmarkStart"),
+    qn("w:bookmarkEnd"),
     qn("w:commentRangeStart"),
     qn("w:commentRangeEnd"),
+    qn("w:txbxContent"),
 }
 
 #: 视为"占一个字符"的元素 -> 该占位字符
@@ -157,6 +180,35 @@ def _is_simple_paragraph(paragraph_element) -> bool:
         if child.tag not in _ALLOWED_PARAGRAPH_CHILDREN:
             return False
     return True
+
+
+def _collect_body_runs(paragraph_element) -> list:
+    """收集段落**自身**的 run，排除嵌套在文本框 / 表格里的。
+
+    不能直接用 ``paragraph_element.iter(qn("w:r"))``——它会一路递归进
+    ``<w:txbxContent>``（文本框）与 ``<w:tbl>``（表格），导致：
+
+    * 文本框内容被**外层段落**抢先去处理，位置标签变成"第 N 段"而非"文本框 N"，
+      报告因此丢失容器归属信息；
+    * 偏移映射里混入不属于本段落的文本，边界判断失真。
+
+    表格内段落由 :mod:`docx_table` 独立遍历、文本框由 :mod:`docx_textbox`
+    独立遍历，这里只负责本段落（含其超链接内）的run。
+
+    Args:
+        paragraph_element: ``<w:p>`` 元素。
+
+    Returns:
+        本段落所属的 ``<w:r>`` 元素列表，保持文档顺序。
+    """
+    runs = []
+    for child in paragraph_element:
+        if child.tag == qn("w:r"):
+            runs.append(child)
+        elif child.tag == qn("w:hyperlink"):
+            # 超链接内的 run 属于本段落（跨链接边界的号码需要它们参与偏移映射）
+            runs.extend(child.iter(qn("w:r")))
+    return runs
 
 
 class DocxHandler(BaseHandler):
@@ -292,6 +344,56 @@ class DocxHandler(BaseHandler):
             if comment_hits:
                 all_hits.extend(comment_hits)
 
+        # ---- 文本框 + 脚注/尾注（优先级 6）----
+        # 文本框内嵌在 document.xml；脚注/尾注是独立 part 且无 element 属性，
+        # 改完必须显式 commit 写回，否则不落盘（见 docx_textbox 模块说明）。
+        textbox_skipped = 0
+        textbox_paragraphs = 0
+        note_skipped = 0
+        note_paragraphs = 0
+
+        try:
+            for paragraph, location in iter_textbox_paragraphs(document):
+                textbox_paragraphs += 1
+                result = self._process_paragraph(
+                    paragraph, location, engine, dry_run=dry_run
+                )
+                if isinstance(result, str):
+                    if result in self._UNSAFE_SKIP:
+                        textbox_skipped += 1
+                    continue
+                box_hits, _ = result
+                if box_hits:
+                    all_hits.extend(box_hits)
+        except RecursionError as exc:
+            raise HandlerError(
+                HandlerError.CORRUPTED, f"文本框处理中止：{exc}"
+            ) from exc
+
+        for note_kind in ("footnote", "endnote"):
+            roots = {}
+            for paragraph, location, root in iter_note_paragraphs(document, note_kind):
+                roots[id(root)] = root
+                note_paragraphs += 1
+                result = self._process_paragraph(
+                    paragraph, location, engine, dry_run=dry_run
+                )
+                if isinstance(result, str):
+                    if result in self._UNSAFE_SKIP:
+                        note_skipped += 1
+                    continue
+                note_hits, _ = result
+                if note_hits:
+                    all_hits.extend(note_hits)
+
+            # 关键：显式写回，否则改动不落盘
+            if not dry_run:
+                part = get_note_part(document, note_kind)
+                if part is not None:
+                    unique_roots = list(roots.values())
+                    if unique_roots:
+                        commit_note_part(part, unique_roots[0])
+
         # ---- URL 脱敏（rels 文件里的 mailto 链接）----
         # 必须在 document.save() **之前**做：rels 改动随 save 一并写入。
         # 页眉页脚有各自的 part 与 rels，也要一并处理（实测页眉里确实可能有链接）。
@@ -357,12 +459,24 @@ class DocxHandler(BaseHandler):
             if comment_skipped:
                 comment_text += f"（其中 {comment_skipped} 个含复杂结构，已跳过未脱敏）"
             parts.append(comment_text)
+        if textbox_paragraphs:
+            box_text = f"文本框共 {textbox_paragraphs} 个段落"
+            if textbox_skipped:
+                box_text += f"（其中 {textbox_skipped} 个含复杂结构，已跳过未脱敏）"
+            parts.append(box_text)
+        if note_paragraphs:
+            note_text = f"脚注/尾注共 {note_paragraphs} 个段落"
+            if note_skipped:
+                note_text += f"（其中 {note_skipped} 个含复杂结构，已跳过未脱敏）"
+            parts.append(note_text)
 
         if (
             skipped_paragraphs
             or table_skipped_cells
             or hf_skipped
             or comment_skipped
+            or textbox_skipped
+            or note_skipped
         ):
             message = "；".join(parts) + "。请人工核查"
             # 首页/偶数页页眉只有在文档开启对应设置时才生效，
@@ -464,7 +578,7 @@ class DocxHandler(BaseHandler):
             if not self._is_simple_hyperlink(hyperlink):
                 return self._SKIP_COMPLEX
 
-        run_elements = list(paragraph_element.iter(qn("w:r")))
+        run_elements = _collect_body_runs(paragraph_element)
         if not run_elements:
             return self._SKIP_EMPTY
 
