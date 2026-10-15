@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import re
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 
@@ -94,6 +94,30 @@ def build_redacted_target(target: str, engine: RedactionEngine) -> Optional[str]
     # Target 是 XML 属性值，占位符含中文与方括号，必须做 URL 编码
     # （实测用 %5B%E9%82%AE%E7%AE%B1%5D 表示 "[邮箱]" 可被 Word 正常读取）
     return f"{scheme}{quote(redacted, safe='@.+-_')}{remainder}"
+
+
+def describe_placeholder(new_target: str) -> str:
+    """从**已脱敏的** Target 反推出报告中应展示的占位符文本。
+
+    报告必须展示真实落盘值，而不是让读者猜。改写后的 Target 里
+    协议头与邮箱占位符都做了 URL 编码（如 ``%5B%E9%82%AE%E7%AE%B1%5D``
+    即 ``[邮箱]``），直接展示会让用户看到一串百分号编码而看不懂，
+    因此这里解码后取"协议头 + 地址"部分。
+
+    查询参数与片段（``?subject=`` / ``#anchor``）不参与展示——
+    它们通常仍保留原文内容，与脱敏结果无关。
+
+    Args:
+        new_target: :func:`build_redacted_target` 的返回值。
+
+    Returns:
+        形如 ``"mailto:[邮箱]"`` 的可读文本；解析失败时返回 ``""``。
+    """
+    match = _MAILTO_PARTS.match((new_target or "").strip())
+    if not match:
+        return ""
+    scheme, address, _remainder = match.group(1), match.group(2), match.group(3)
+    return f"{scheme}{unquote(address)}"
 
 
 def redact_hyperlink_targets(

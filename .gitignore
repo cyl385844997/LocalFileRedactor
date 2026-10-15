@@ -18,6 +18,9 @@ out/
 *_probe/
 probe/
 
+# 验证产物目录（.verify/：测试输出、报告样本、临时 docx，一律不入库）
+.verify/
+
 # pytest / 工具缓存
 .pytest_cache/
 .pytest_tmp/

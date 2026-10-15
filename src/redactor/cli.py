@@ -201,7 +201,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
             report.add(_process_one(source, output_root, input_root, engine, args))
 
     if args.report:
-        report.save(args.report, as_json=args.report_format == "json")
+        # text 报告加 UTF-8 BOM：Windows 的 type / 记事本按GBK 解码无 BOM 的
+        # UTF-8 会乱码，加 BOM 后它们能正确识别。
+        # JSON 一律不加——json.load() 遇 BOM 会抛 Unexpected UTF-8 BOM。
+        report.save(
+            args.report,
+            as_json=args.report_format == "json",
+            bom=args.report_format != "json",
+        )
 
     print(report.to_json() if args.report_format == "json" else report.to_text())
 
@@ -253,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--only", nargs="+", help="只启用指定名称的规则")
         sub.add_argument("--numbered", action="store_true", help="强制使用编号占位符（如 [手机号#1]，会暴露同一性，默认关闭）")
         sub.add_argument("-r", "--recursive", action="store_true", help="递归处理子目录")
-        sub.add_argument("--report", help="把报告另存到指定文件")
+        sub.add_argument("--report", help="把报告另存到指定文件（文本报告带 UTF-8 BOM，Windows 下可直接 type 查看；JSON 不带 BOM）")
         sub.add_argument("--report-format", choices=["text", "json"], default="text", help="报告格式（默认 text）")
 
     run_parser = subparsers.add_parser("run", help="执行脱敏并输出到新文件/新目录")

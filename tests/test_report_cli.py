@@ -502,3 +502,127 @@ class TestOfflineGuarantee:
         content = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         for banned in ("requests", "httpx", "urllib3", "aiohttp", "boto3"):
             assert banned not in content, f"依赖中出现网络库：{banned}"
+
+class TestReportEncoding:
+    """报告落盘的编码约定（Windows 中文环境下 type 乱码问题）。
+
+    背景：Windows 的 ``type`` / 记事本按系统默认编码（简体中文 Windows 为
+    GBK）解码无 BOM 的 UTF-8，中文显示为乱码。文本报告因此加UTF-8 BOM。
+
+    **JSON 绝不能加 BOM**——``json.load()`` 遇 BOM 会抛
+    ``Unexpected UTF-8 BOM``，那会让下游系统读取失败，是净损失。
+    """
+
+    def _report(self) -> Report:
+        report = Report(dry_run=True)
+        report.add(
+            FileResult(
+                source="a.docx",
+                status="ok",
+                hits=[HitStat("手机号", 1, ("第 1 段",))],
+            )
+        )
+        return report
+
+    def test_默认不加BOM(self, tmp_path):
+        """默认保持无 BOM（标准做法，跨平台一致），不改变既有行为。"""
+        path = tmp_path / "r.txt"
+        self._report().save(str(path))
+        assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    def test_bom为False时明确不加(self, tmp_path):
+        path = tmp_path / "r.txt"
+        self._report().save(str(path), bom=False)
+        assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    def test_bom为True时写入UTF8_BOM(self, tmp_path):
+        """bom=True 应写入标准 UTF-8 BOM 头（EF BB BF）。"""
+        path = tmp_path / "r.txt"
+        self._report().save(str(path), bom=True)
+        raw = path.read_bytes()
+        assert raw.startswith(b"\xef\xbb\xbf")
+
+    def test_bom文件用utf8_sig可正确解码(self, tmp_path):
+        """带 BOM 的文件必须能被正确读回，且中文内容不损坏。"""
+        path = tmp_path / "r.txt"
+        self._report().save(str(path), bom=True)
+        text = path.read_text(encoding="utf-8-sig")
+        assert "手机号" in text
+        assert "本地文件脱敏报告" in text
+
+    def test_bom文件用普通utf8解码会带BOM字符(self, tmp_path):
+        """记录一个事实：带 BOM 的文件按纯 utf-8 读，首部会多出 BOM 字符。
+
+        这不是缺陷而是取舍——它证明"用 utf-8-sig 读"才是正确姿势。
+        """
+        path = tmp_path / "r.txt"
+        self._report().save(str(path), bom=True)
+        text = path.read_text(encoding="utf-8")
+        assert text.startswith("﻿")
+
+    def test_JSON报告即使传bom也不加(self, tmp_path):
+        """JSON 路径不受 bom 参数影响——必须保持无 BOM 才能被 json.load 读取。"""
+        path = tmp_path / "r.json"
+        self._report().save(str(path), as_json=True, bom=True)
+        raw = path.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf")
+
+    def test_JSON报告可被json_load解析(self, tmp_path):
+        """端到端：加不加 BOM，JSON 都必须能被标准 json.load 读取。"""
+        for bom in (None, False, True):
+            path = tmp_path / f"r_{bom}.json"
+            self._report().save(str(path), as_json=True, bom=bom)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert "files" in data, f"bom={bom} 时 JSON 结构异常"
+
+    def test_两种模式内容一致仅BOM不同(self, tmp_path):
+        """加 BOM 不改变报告内容本身。"""
+        plain = tmp_path / "a.txt"
+        bommed = tmp_path / "b.txt"
+        self._report().save(str(plain))
+        self._report().save(str(bommed), bom=True)
+        assert plain.read_bytes() == bommed.read_bytes().lstrip(b"\xef\xbb\xbf")
+
+    def test_换行符统一为LF(self, tmp_path):
+        """跨平台一致：报告恒用 LF，不随系统变成 CRLF。"""
+        for bom in (None, True):
+            path = tmp_path / f"r_{bom}.txt"
+            self._report().save(str(path), bom=bom)
+            assert b"\r\n" not in path.read_bytes(), f"bom={bom} 时出现 CRLF"
+
+    def test_CLI文本报告落盘带BOM(self, tmp_path, capsys):
+        """端到端：``--report xxx.txt`` 产出的文件带 BOM。
+
+        这里自建干净目录而非复用 workdir fixture——后者刻意含一个
+        必然失败的旧版 .doc，会让退出码为 1，与本用例无关。
+        """
+        src = tmp_path / "干净目录"
+        src.mkdir()
+        (src / "a.txt").write_text(f"手机 {FAKE_PHONE_1}\n", encoding="utf-8")
+        report_path = tmp_path / "报告.txt"
+        code = cli.main([
+            "dry-run", str(src),
+            "--report", str(report_path),
+            "--report-format", "text",
+        ])
+        capsys.readouterr()
+        assert code == 0
+        assert report_path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    def test_CLI_JSON报告落盘不带BOM(self, tmp_path, capsys):
+        """端到端：``--report xxx.json`` 产出无 BOM，且可被 json.load 读取。"""
+        src = tmp_path / "干净目录2"
+        src.mkdir()
+        (src / "a.txt").write_text(f"手机 {FAKE_PHONE_1}\n", encoding="utf-8")
+        report_path = tmp_path / "报告.json"
+        code = cli.main([
+            "dry-run", str(src),
+            "--report", str(report_path),
+            "--report-format", "json",
+        ])
+        capsys.readouterr()
+        assert code == 0
+        raw = report_path.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf")
+        data = json.loads(raw.decode("utf-8"))
+        assert "files" in data

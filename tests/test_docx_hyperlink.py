@@ -394,3 +394,153 @@ class TestNoOtherContainers:
         source = make_hyperlink_sample()
         result = DocxHandler().process(source, samples_dir / "out.docx", engine)
         assert result.message is None or "跳过" not in result.message
+
+class TestPlaceholderReporting:
+    """方案 B：报告里的占位符必须是**真实落盘值**，不能按规则名反推。
+
+    背景：mailto Target 的改写不对应任何一条脱敏规则（改的是 rels 里的
+    URL，而非正文文本），报告若显示 "[超链接目标]"，用户会以为文档里写的是
+    这个字符串，而真实落盘值是 ``mailto:[邮箱]``——报告就在说谎。
+    """
+
+    def test_报告占位符为真实落盘值(self, engine, samples_dir):
+        """逐文件明细里的占位符应是 mailto:[邮箱]。"""
+        source = make_hyperlink_sample()
+        result = DocxHandler().process(source, samples_dir / "out.docx", engine)
+
+        url_stats = [s for s in result.hits if s.rule_name == "超链接目标"]
+        assert url_stats, "mailto 链接应产生一条 URL 命中统计"
+        assert url_stats[0].placeholder == "mailto:[邮箱]"
+
+    def test_报告占位符与rels实际值一致(self, engine, samples_dir):
+        """报告展示的占位符，解码后必须与 rels 里真实写入的 Target 相同。
+
+        这是端到端一致性检查：报告说的 == 文档里写的。
+        """
+        from urllib.parse import unquote
+
+        source = make_hyperlink_sample()
+        output = samples_dir / "out.docx"
+        result = DocxHandler().process(source, output, engine)
+
+        url_stat = next(s for s in result.hits if s.rule_name == "超链接目标")
+        shown = url_stat.placeholder  # 例如 mailto:[邮箱]
+        address = shown.split(":", 1)[1]  # 去掉 mailto: 协议头
+
+        with zipfile.ZipFile(output) as zf:
+            rels = zf.read("word/_rels/document.xml.rels").decode("utf-8")
+
+        targets = [
+            unquote(t)
+            for t in _extract_targets(rels)
+            if unquote(t).startswith("mailto:")
+        ]
+        assert targets, "rels 里应有 mailto 关系"
+        for target in targets:
+            assert target == f"mailto:{address}", (
+                f"报告声称写入 {address}，实际 Target 为 {target}"
+            )
+
+    def test_按规则统计行不再硬编码规则名(self, engine, samples_dir):
+        """「按规则统计」那一节也不能再显示 -> [超链接目标]。"""
+        from redactor.report import Report as RedactionReport
+
+        source = make_hyperlink_sample()
+        output = samples_dir / "out.docx"
+        result = DocxHandler().process(source, output, engine)
+
+        report = RedactionReport(dry_run=False)
+        report.add(result)
+        text = report.to_text()
+
+        assert "-> [超链接目标]" not in text, "按规则统计仍在显示未落盘的占位符"
+        assert "mailto:[邮箱]" in text
+
+    def test_describe_placeholder解码百分号编码(self, engine):
+        """describe_placeholder 应把 %5B..%5D 解码回方括号形式。"""
+        from redactor.handlers.docx_url import describe_placeholder
+
+        new_target = build_redacted_target(f"mailto:{FAKE_EMAIL}", engine)
+        assert new_target is not None
+        assert "%5B" in new_target, "Target 应是 URL 编码形式"
+        assert describe_placeholder(new_target) == "mailto:[邮箱]"
+
+    def test_describe_placeholder忽略query(self, engine):
+        """?subject= 等查询参数不参与展示（其内容未被脱敏）。"""
+        from redactor.handlers.docx_url import describe_placeholder
+
+        new_target = build_redacted_target(
+            f"mailto:{FAKE_EMAIL}?subject=咨询", engine
+        )
+        assert describe_placeholder(new_target) == "mailto:[邮箱]"
+
+    def test_describe_placeholder对非mailto返回空(self):
+        from redactor.handlers.docx_url import describe_placeholder
+
+        assert describe_placeholder("https://example.com/x") == ""
+        assert describe_placeholder("") == ""
+
+    def test_HitStat缺省仍按规则名反推(self):
+        """未显式给占位符时，行为与旧版一致（向后兼容）。"""
+        from redactor.core.models import HitStat
+
+        assert HitStat("手机号", 3).placeholder == "[手机号]"
+        assert HitStat("邮箱", 1, ("第 2 段",)).placeholder == "[邮箱]"
+
+    def test_HitStat显式占位符优先(self):
+        """显式值优先于规则名反推。"""
+        from redactor.core.models import HitStat
+
+        stat = HitStat("超链接目标", 2, ("rels",), placeholder_text="mailto:[邮箱]")
+        assert stat.placeholder == "mailto:[邮箱]"
+
+    def test_HitStat显式空串回退到规则名(self):
+        """显式传空串视为未提供，避免报告出现空的 -> 。"""
+        from redactor.core.models import HitStat
+
+        assert HitStat("甲", 1, (), placeholder_text="").placeholder == "[甲]"
+
+    def test_HitStat为frozen且可哈希(self):
+        """新增字段不得破坏 frozen 语义（报告可能被放进 set/dict）。"""
+        from redactor.core.models import HitStat
+
+        stat = HitStat("甲", 1, (), "x")
+        assert hash(stat) == hash(HitStat("甲", 1, (), "x"))
+        with pytest.raises(Exception):
+            stat.count = 2  # type: ignore[misc]
+
+    def test_JSON报告含真实占位符(self, engine, samples_dir):
+        """JSON 导出同样要反映真实占位符（供下游系统消费）。"""
+        import json
+
+        from redactor.report import Report as RedactionReport
+
+        source = make_hyperlink_sample()
+        output = samples_dir / "out.docx"
+        result = DocxHandler().process(source, output, engine)
+
+        report = RedactionReport(dry_run=False)
+        report.add(result)
+        data = json.loads(report.to_json())
+
+        hits = data["files"][0]["hits"]
+        url_hit = next(h for h in hits if h["rule"] == "超链接目标")
+        assert url_hit["placeholder"] == "mailto:[邮箱]"
+
+    def test_无mailto时沿用规则名反推(self, engine, samples_dir):
+        """纯 https 文档不应凭空多出 URL 命中统计。"""
+        document = Document()
+        paragraph = document.add_paragraph()
+        add_hyperlink(paragraph, "https://example.com/contact", "联系页")
+        source = samples_dir / "https_only.docx"
+        document.save(str(source))
+
+        result = DocxHandler().process(source, samples_dir / "out2.docx", engine)
+        assert not [s for s in result.hits if s.rule_name == "超链接目标"]
+
+
+def _extract_targets(rels_xml: str) -> List[str]:
+    """从 rels XML 里取出所有 Target 值。"""
+    import re
+
+    return re.findall(r'Target="([^"]+)"', rels_xml)

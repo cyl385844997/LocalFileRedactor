@@ -91,15 +91,30 @@ class HitStat:
         rule_name: 规则名。
         count: 命中次数。
         locations: 位置描述列表（如 ``第 3 段`` / ``第 2 页``），由各 handler 生成。
+        placeholder_text: **显式**占位符文本。``None`` 时由 :attr:`placeholder`
+            按规则名反推（见该属性的说明）。
     """
 
     rule_name: str
     count: int
     locations: Tuple[str, ...] = ()
+    placeholder_text: Optional[str] = None
 
     @property
     def placeholder(self) -> str:
-        """占位符文本，由规则名推导。"""
+        """报告中展示的占位符文本。
+
+        优先用显式的 :attr:`placeholder_text`，缺省才按规则名反推。
+
+        **为什么需要显式值**：按规则名反推只对"引擎按规则替换"的命中成立。
+        存在一类命中并不来自引擎对某条规则的替换，而是 handler 自行写入的
+        结构化改写——例如 docx 的 mailto 超链接：``rels`` 里的 Target 被改写为
+        ``mailto:[邮箱]``，它不对应任何一条规则，报告若显示 ``[超链接目标]``
+        会让用户误以为文档里写的是这个字符串，而实际落盘值是 ``mailto:[邮箱]``。
+        这类命中必须自带真实占位符，否则报告就在说谎。
+        """
+        if self.placeholder_text:
+            return self.placeholder_text
         return f"[{self.rule_name}]"
 
 

@@ -68,6 +68,24 @@ class Report:
                 counter[stat.rule_name] = counter.get(stat.rule_name, 0) + stat.count
         return dict(sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
 
+    @property
+    def placeholder_by_rule(self) -> Dict[str, str]:
+        """各规则名对应的**报告展示占位符**。
+
+        供「按规则统计」一节使用：那一行原本硬编码 ``-> [{rule_name}]``，
+        对"非引擎来源"的命中（如 docx mailto Target 改写）会显示一个
+        根本没写进文档的字符串。这里改从 :attr:`HitStat.placeholder` 取，
+        它已支持显式占位符（见 :class:`~redactor.core.models.HitStat`）。
+
+        同一规则名出现不同占位符时取第一个——统计行只需展示一个代表值，
+        逐条差异由「逐文件明细」那一节用各自的 stat 展示。
+        """
+        mapping: Dict[str, str] = {}
+        for result in self.results:
+            for stat in result.hits:
+                mapping.setdefault(stat.rule_name, stat.placeholder)
+        return mapping
+
     # ---- 输出 ----
     def to_dict(self) -> dict:
         """转为可 JSON 序列化的字典（同样零敏感内容）。"""
@@ -120,10 +138,14 @@ class Report:
 
         by_rule = self.hit_by_rule
         if by_rule:
+            placeholders = self.placeholder_by_rule
             lines.append("")
             lines.append("按规则统计：")
             for rule_name, count in by_rule.items():
-                lines.append(f"  - {rule_name}：{count} 处 -> [{rule_name}]")
+                # 占位符取自 HitStat.placeholder，不再按规则名硬拼——
+                # 否则非引擎来源的命中会显示一个并未写入文档的字符串。
+                shown = placeholders.get(rule_name, f"[{rule_name}]")
+                lines.append(f"  - {rule_name}：{count} 处 -> {shown}")
 
         lines.append("")
         lines.append("逐文件明细：")
@@ -168,13 +190,36 @@ class Report:
         lines.append("本工具不联网、不上传，所有处理均在本机完成，原文件未被修改。")
         return "\n".join(lines)
 
-    def save(self, path: str, *, as_json: bool = False) -> None:
+    def save(
+        self,
+        path: str,
+        *,
+        as_json: bool = False,
+        bom: Optional[bool] = None,
+    ) -> None:
         """把报告写入文件。
+
+        编码
+        ----
+        默认写**无 BOM 的 UTF-8**（标准做法，跨平台一致）。
+
+        Windows 的 ``type`` 命令与部分老旧编辑器按系统默认编码（简体中文
+        Windows 为 GBK）解码无 BOM 的 UTF-8，中文会显示为乱码。
+        此时可传 ``bom=True`` 写入 UTF-8 BOM，让这些工具正确识别。
+
+        **JSON 绝不能加 BOM**：``json.load()`` 遇到 BOM 会直接抛
+        ``Unexpected UTF-8 BOM``，导致下游系统读取失败——那是净损失而非改进。
+        因此 ``as_json=True`` 时本方法**忽略** ``bom`` 参数，恒定不加 BOM。
 
         Args:
             path: 报告输出路径。
             as_json: True 写 JSON，False 写文本。
+            bom: True 写 UTF-8 BOM，False 明确不加，None（默认）不加。
+                **仅对文本报告生效**，JSON 一律忽略。仅在调用方明确知道
+                目标读者用 Windows 工具直读时开启。
         """
         content = self.to_json() if as_json else self.to_text()
-        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        # JSON 路径恒不加BOM：json.load 遇 BOM 会抛 Unexpected UTF-8 BOM
+        encoding = "utf-8-sig" if (bom and not as_json) else "utf-8"
+        with open(path, "w", encoding=encoding, newline="\n") as handle:
             handle.write(content)

@@ -73,7 +73,7 @@ from redactor.handlers.docx_textbox import (
     iter_note_paragraphs,
     iter_textbox_paragraphs,
 )
-from redactor.handlers.docx_url import redact_hyperlink_targets
+from redactor.handlers.docx_url import describe_placeholder, redact_hyperlink_targets
 
 # ---------------------------------------------------------------------------
 # br/tab 支持（优先级 1）
@@ -398,6 +398,7 @@ class DocxHandler(BaseHandler):
         # 必须在 document.save() **之前**做：rels 改动随 save 一并写入。
         # 页眉页脚有各自的 part 与 rels，也要一并处理（实测页眉里确实可能有链接）。
         url_hit_count = 0
+        url_placeholders: List[str] = []
         try:
             url_parts = [document.part]
             hf_items_for_url, _ = collect_header_footer_items(document)
@@ -406,6 +407,10 @@ class DocxHandler(BaseHandler):
             for part in url_parts:
                 url_hits = redact_hyperlink_targets(part, engine, dry_run=dry_run)
                 url_hit_count += len(url_hits)
+                for _rid, _old, new_target in url_hits:
+                    label = describe_placeholder(new_target)
+                    if label and label not in url_placeholders:
+                        url_placeholders.append(label)
         except HandlerError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -424,13 +429,19 @@ class DocxHandler(BaseHandler):
             except OSError as exc:
                 raise HandlerError(HandlerError.IO_ERROR, f"写入失败：{output}（{exc}）") from exc
 
-        # URL 命中单独记一条统计（位置标为"超链接目标"，不含原地址）
+        # URL 命中单独记一条统计。
+        #
+        # 这类命中**不对应任何一条脱敏规则**（改的是 rels 里的 Target，
+        # 而非正文里的某段文本），所以占位符不能按规则名反推——
+        # 报告若显示 "[超链接目标]"，用户会以为文档里写的是这个字符串，
+        # 而真实落盘值是 mailto:[邮箱]。必须显式携带真实占位符。
         if url_hit_count:
             all_hits.append(
                 HitStat(
                     rule_name="超链接目标",
                     count=url_hit_count,
                     locations=("超链接目标（rels）",),
+                    placeholder_text="、".join(url_placeholders) or None,
                 )
             )
 
@@ -634,17 +645,30 @@ class DocxHandler(BaseHandler):
 
     @staticmethod
     def _merge_hits(hits: List[HitStat]) -> List[HitStat]:
-        """把逐段命中合并成按规则聚合的统计。"""
+        """把逐段命中合并成按规则聚合的统计。
+
+        **必须透传``placeholder_text``**：合并会新建 :class:`HitStat`，
+        若不带上显式占位符，URL 命中的真实占位符（``mailto:[邮箱]``）
+        会在这一步丢失，报告又退回按规则名反推的旧行为。
+        """
         counter: Dict[str, int] = {}
         locations: Dict[str, List[str]] = {}
+        placeholders: Dict[str, str] = {}
         for stat in hits:
             counter[stat.rule_name] = counter.get(stat.rule_name, 0) + stat.count
             bucket = locations.setdefault(stat.rule_name, [])
             for label in stat.locations:
                 if label not in bucket:
                     bucket.append(label)
+            if stat.placeholder_text and stat.rule_name not in placeholders:
+                placeholders[stat.rule_name] = stat.placeholder_text
         return [
-            HitStat(rule_name=name, count=count, locations=tuple(locations[name]))
+            HitStat(
+                rule_name=name,
+                count=count,
+                locations=tuple(locations[name]),
+                placeholder_text=placeholders.get(name),
+            )
             for name, count in sorted(counter.items())
         ]
 
