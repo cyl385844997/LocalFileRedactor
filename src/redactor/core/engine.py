@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from redactor.core.lexicon import LexiconEntry
 from redactor.core.models import HitStat, Match, Rule
 from redactor.recognizers.base import Recognizer
 from redactor.recognizers.regex_recognizer import build_recognizer
@@ -19,17 +20,32 @@ from redactor.redactors.replacer import PlaceholderReplacer, resolve_overlaps
 class RedactionEngine:
     """脱敏引擎。"""
 
-    def __init__(self, rules: Sequence[Rule], *, force_numbered: bool = False):
+    def __init__(
+        self,
+        rules: Sequence[Rule],
+        *,
+        force_numbered: bool = False,
+        lexicon_entries: Optional[Sequence[LexiconEntry]] = None,
+    ):
         """初始化引擎。
 
         Args:
             rules: 已加载并校验过的规则列表（顺序即优先级）。
             force_numbered: True 时所有规则强制使用编号占位符。
+            lexicon_entries: 自定义词库条目（来自 :mod:`redactor.core.lexicon`）。
+
+                **首版仅存储，尚未参与匹配** —— 识别器将在后续模块接入
+                （``_recognizers`` 的追加逻辑）。当前传入非空词库不会改变
+                ``scan`` / ``redact`` 的行为，这���首版的已知限制。
         """
         if not rules:
             raise ValueError("规则列表为空，无法启动脱敏引擎")
         self._rules: List[Rule] = list(rules)
+        self._lexicon_entries: List[LexiconEntry] = list(lexicon_entries or [])
         self._recognizers: List[Recognizer] = [build_recognizer(rule) for rule in self._rules]
+        # TODO(模块 2): 在这里为 self._lexicon_entries 追加 LexiconRecognizer，
+        #   位置必须在末尾 —— priority 由规则在列表中的下标决定，
+        #   追加到末尾才能保证词库优先级低于全部内置正则。
         # 编号分配器必须是"每次任务一个"，否则编号会跨文件延续
         self._replacer = PlaceholderReplacer(self._rules, force_numbered=force_numbered)
         self._priority: Dict[str, int] = {rule.name: i for i, rule in enumerate(self._rules)}
@@ -38,6 +54,11 @@ class RedactionEngine:
     def rules(self) -> List[Rule]:
         """当前生效的规则列表。"""
         return list(self._rules)
+
+    @property
+    def lexicon_entries(self) -> List[LexiconEntry]:
+        """当前已加载的词库条目（首版尚未参与匹配，见 :meth:`__init__`）。"""
+        return list(self._lexicon_entries)
 
     def scan(self, text: str) -> List[Match]:
         """只识别不替换，用于 --dry-run 与自检。
