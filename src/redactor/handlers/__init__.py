@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Type
 
 from redactor.handlers.base import BaseHandler, HandlerError, prepare_output
 from redactor.handlers.docx_handler import DocxHandler
+from redactor.handlers.pdf_handler import NO_TEXT_LAYER, PdfHandler
 from redactor.handlers.txt_handler import TxtHandler, read_text_safe
 
 #: 扩展名 -> handler 类
@@ -40,6 +41,7 @@ def _register(handler_cls: Type[BaseHandler]) -> None:
 
 _register(TxtHandler)
 _register(DocxHandler)
+_register(PdfHandler)
 
 
 def get_handler(path: str | Path) -> BaseHandler:
@@ -77,6 +79,8 @@ __all__ = [
     "BaseHandler",
     "HandlerError",
     "DocxHandler",
+    "PdfHandler",
+    "NO_TEXT_LAYER",
     "TxtHandler",
     "read_text_safe",
     "get_handler",

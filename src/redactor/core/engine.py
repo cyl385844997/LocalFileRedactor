@@ -69,6 +69,15 @@ class RedactionEngine:
         return list(self._rules)
 
     @property
+    def recognizers(self) -> List[Recognizer]:
+        """当前生效的识别器列表（只读副本）。
+
+        供 handler 逐载体调用 :meth:`Recognizer.find_in_span`。
+        返回副本而非内部列表，避免外部改动引擎内部状态。
+        """
+        return list(self._recognizers)
+
+    @property
     def lexicon_entries(self) -> List[LexiconEntry]:
         """当前已加载的词库条目（首版尚未参与匹配，见 :meth:`__init__`）。"""
         return list(self._lexicon_entries)

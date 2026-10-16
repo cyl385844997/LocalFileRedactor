@@ -24,6 +24,7 @@ REASON_LABELS: Dict[str, str] = {
     "empty_file": "文件为空",
     "unknown_error": "未知错误",
     "rule_error": "规则文件加载失败",
+    "pdf_no_text_layer": "PDF 无文本层（扫描件），不做 OCR 已跳过",
 }
 
 
