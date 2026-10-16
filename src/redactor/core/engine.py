@@ -8,7 +8,7 @@ handlers 层只负责把文件内容拆成文本块交给它，再把结果写�
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from redactor.core.lexicon import LexiconEntry
 from redactor.core.models import HitStat, Match, Rule
@@ -126,34 +126,102 @@ class RedactionEngine:
         return self._replacer.placeholder_for(match)
 
     @staticmethod
-    def aggregate(matches: Iterable[Match], locations: Optional[Dict[Tuple[str, int], str]] = None) -> List[HitStat]:
+    def aggregate(
+        matches: Iterable[Match],
+        locations: Optional[Dict[Tuple, str]] = None,
+        *,
+        key_of: Optional[Callable[[Match], Tuple]] = None,
+        strict: bool = True,
+    ) -> List[HitStat]:
         """把命中聚合成"规则名 + 次数 + 位置"的统计，**不含任何原文**。
+
+        ``count`` 与 ``locations`` 是**两套结构**，靠"键推导必须一致"这一
+        隐性约定联结。约定一旦破坏就会**静默少报**，故此处有两道防线：
+
+        1. **``count`` 取自命中本身，不取自标签个数**（见 Note 1）。
+        2. **取不到标签即抛错**（``strict=True``，见 Note 2）。
 
         Args:
             matches: 生效的命中列表。
-            locations: ``(规则名, start) -> 位置描述`` 映射；缺省则不记录位置。
+            locations: ``key -> 位置描述`` 映射；缺省则不记录位置。
+            key_of: 由 :class:`Match` 生成 ``locations`` 键的函数。
+                缺省用 ``(rule_name, start)``—— 这对**单一连续文本**成立，
+                但对**分页载体**（如 PDF）会撞键：
+                每页的 ``start`` 都是页内偏移，两页同布局就会产生相同的
+                ``(rule_name, start)``，后者覆盖前者，导致报告少报
+                （合成 3 页同布局样本复现：只报 1 处）。
+
+                故 PDF handler 传入 :func:`redactor.handlers.pdf_handler.location_key`
+                （命名函数，返回三元组 ``(rule_name, page_index, start)``）。
+            strict: ``locations`` 非空时，若有命中取不到标签是否抛错。
+                默认 ``True``。设为 ``False`` 只在确有"部分命中无需位置"
+                的场景下使用，并应自行承担少报风险。
 
         Returns:
             按规则名排序的 :class:`HitStat` 列表。
+
+        Raises:
+            ValueError: ``strict=True`` 且 ``locations`` 非空，但有命中
+                取不到标签——这几乎总是 ``key_of`` 与 ``locations`` 的键
+                不一致。此时**必须报错而不是静默丢命中**：曾实测「传三元键
+                ``locations`` 但忘传 ``key_of``」，24 处命中的报告直接变成
+                0 处，全程无异常、无告警。
+
+        Note:
+            1. **``count`` 是命中数，不是标签数**。
+               早期实现把 ``count`` 写成去重后的标签个数，于是"同一位置标签
+               对应多处命中"时会少报。合成样本复现：一行内两个手机号，
+               标签都是 ``第 1 行``，``count`` 被压成 1（实际删了 2 处）。
+               位置标签只负责"告诉人去哪儿看"，不该反过来决定计数。
+
+            2. **键用 tuple 而非打包整数**（如 ``page * 10**7 + start``）：
+               打包整数依赖"单页文本不超过 10^7 字符"这一隐含假设，
+               一旦遇到异常大的页面就会静默撞键、报告再次少报且无任何报错。
+               tuple 键无此假设，多一个元素的成本可忽略。
         """
+        make_key = key_of if key_of is not None else (
+            lambda m: (m.rule_name, m.start)
+        )
+        ordered = list(matches)
+
+        # count 的唯一来源：命中本身。locations 只影响"位置"这一展示字段。
+        counts: Dict[str, int] = {}
         buckets: Dict[str, List[str]] = {}
-        for match in matches:
+        unlabeled: List[Tuple[str, Tuple]] = []
+
+        for match in ordered:
+            counts[match.rule_name] = counts.get(match.rule_name, 0) + 1
+            if locations is None:
+                continue
+            key = make_key(match)
+            label = locations.get(key)
+            if not label:
+                unlabeled.append((match.rule_name, key))
+                continue
             bucket = buckets.setdefault(match.rule_name, [])
-            if locations is not None:
-                label = locations.get((match.rule_name, match.start))
-                if label and label not in bucket:
-                    bucket.append(label)
-            else:
-                # 没有位置信息时，用"共 N 处"的占位说明，报告中不留原文
-                bucket.append("")
+            if label not in bucket:      # 去重后按出现顺序保留
+                bucket.append(label)
+
+        if unlabeled and strict:
+            shown = "、".join(f"{name}{key}" for name, key in unlabeled[:5])
+            more = f" 等 {len(unlabeled)} 处" if len(unlabeled) > 5 else ""
+            raise ValueError(
+                f"aggregate 收到 locations，但有 {len(unlabeled)} 处命中"
+                f"取不到位置标签（{shown}{more}）。"
+                f"这几乎总是 key_of 与 locations 的键不一致——两者必须由"
+                f"同一个键函数生成。若放任不管，这些命中会被静默丢弃、"
+                f"报告少报（曾实测 24 处变成 0 处，无任何报错）。"
+                f"请检查调用方：PDF 必须传 key_of=location_key（三元键含页码）。"
+            )
 
         stats: List[HitStat] = []
-        for rule_name, locs in buckets.items():
-            if locations is None:
-                stats.append(HitStat(rule_name=rule_name, count=len(locs), locations=()))
-            else:
-                # 去重后按出现顺序保留
-                unique = tuple(dict.fromkeys(x for x in locs if x))
-                stats.append(HitStat(rule_name=rule_name, count=len(locs), locations=unique))
+        for rule_name, count in counts.items():
+            stats.append(
+                HitStat(
+                    rule_name=rule_name,
+                    count=count,
+                    locations=tuple(buckets.get(rule_name, ())),
+                )
+            )
         stats.sort(key=lambda s: s.rule_name)
         return stats

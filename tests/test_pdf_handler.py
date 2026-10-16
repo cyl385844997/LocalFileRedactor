@@ -1,9 +1,16 @@
-"""PDF 处理器 P1.1/P1.2 的单元测试。
+"""PDF 处理器单元测试（覆盖 P1.1 – P1.5）。
 
-重点覆盖三条"关键要求"：
-    1. **无文本层页面必须报错**，不静默通过
-    2. **find_in_span 必须按 offset 换算全局坐标**（一个 span 可能只有1 个字）
-    3. **必须遍历全部命中**（实测search_for 返回 3 个 rect 只处理 1 个会残留）
+阶段与重点：
+    P1.1 骨架 / 分派 / **无文本层必须报错**
+    P1.2 find_in_span —— 必须按 offset 换算全局坐标
+    P1.3 redaction —— 遍历全部命中、跨 span 合并、返回值检查、自适应扩框
+    P1.4 表格定位 —— find_tables() 行列号（失败须静默降级）
+    P1.5 报告集成 —— **跨页同偏移不得撞键少报**（Marvis 发现的缺陷）
+
+**贯穿全程的三条硬要求**（均由合成样本复现的坑）：
+    1. 无文本层页面（扫描件）必须报错，不静默通过
+    2. ``insert_textbox`` 放不下时**不抛异常、只返回负数**，必须检查返回值
+    3. 位置标签的键必须含页码——``start`` 只是页内偏移
 """
 
 from __future__ import annotations
@@ -24,10 +31,12 @@ from redactor.handlers.pdf_common import (
     TextBoxHit,
     extract_spans,
     merge_overlapping_rects,
+    cell_for_rect,
+    locate_cells,
     page_has_text_layer,
     rects_for_hits,
 )
-from redactor.handlers.pdf_handler import NO_TEXT_LAYER, PdfHandler
+from redactor.handlers.pdf_handler import NO_TEXT_LAYER, PdfHandler, location_key
 
 BUILTIN = Path(__file__).resolve().parents[1] / "rules" / "builtin.yaml"
 
@@ -184,10 +193,12 @@ class TestFindInSpan:
         assert engine.recognizers[0].find_in_span("", 100) == []
 
     def test_单字span也能匹配(self, tmp_path):
-        """实测坑：真实 PDF 里一个 span 可能只有 1 个字（如单独成 span 的'年'）。
+        """真实 PDF 里一个 span 可能只有 1 个字（如单独成 span 的'年'）。
 
-        注意：PyMuPDF 会把**相邻且同字体**的 span 合并，因此无法用
-        insert_text 合成单字 span。故这里直接构造 :class:`SpanInfo` 对象，
+        注意：PyMuPDF 会把**相邻且同字体**的 span 合并（实测 ``insert_text``
+        逐字写入 11 位号码后仍只有 1 个 span，见
+        ``.verify/probe_span_merge.py``），因此无法用 insert_text 合成单字
+        span。故这里直接构造 :class:`SpanInfo` 对象，
         以真实的单字 span 形态验证 ``find_in_span`` 的换算逻辑——
         这才是 handler 实际会遇到的输入。
         """
@@ -301,7 +312,7 @@ class TestScanHits:
         assert total >= 3, "应收集到全部命中"
 
     def test_重复命中要全部收集(self, tmp_path):
-        """实测坑 3：同一串出现多次时，每次都必须收集到，不能只取第一个。"""
+        """硬要求 3：同一串出现多次时，每次都必须收集到，不能只取第一个。"""
         pdf = tmp_path / "rep.pdf"
         doc = fitz.open()
         page = doc.new_page()
@@ -391,16 +402,35 @@ class TestRedaction:
         assert len(doc[0].search_for("重庆某某水务")) == 0
         doc.close()
 
-    def test_L3_字节流三种编码均无原文(self, tmp_path):
-        """L3：底层字节流里也没有——这才是"真删"的证据。"""
+    def test_L3_内容流解码后无原文(self, tmp_path):
+        """L3：内容流解码域里没有原文 —— 这才是"真删"的证据。
+
+        **注意这条断言的形态**：它不能写成"在原始字节里搜明文 = 0"。
+        Marvis 指出那样写是**空转断言**——PDF 的文本以**十六进制字形字节**
+        存在内容流里（``<b7b7203133383030313338303030>``），原始字节里
+        根本不含明文，**未脱敏的源文件同样返回 0**，因此不构成删净证据。
+
+        故改为差分验证：**源文件必须能检出**（证明搜索域有鉴别力），
+        **输出文件必须为 0**（这才是删净）。详见
+        :mod:`redactor.handlers.pdf_verify` 与 ``tests/test_pdf_verify.py``
+        里的反向对照用例。
+        """
+        from redactor.handlers.pdf_verify import verify_residue
+
         src = make_pdf(tmp_path / "t.pdf")
         out = self._run(tmp_path, src)
-        raw = out.read_bytes()
-        for needle in ("13800138000", "zhangsan@example.com"):
-            for enc in ("utf-8", "gbk", "utf-16-be"):
-                assert raw.count(needle.encode(enc)) == 0, (
-                    f"{needle} 以 {enc} 编码仍残留在字节流中"
-                )
+        checks = verify_residue(
+            src, out, ["13800138000", "zhangsan@example.com"]
+        )
+        for check in checks:
+            assert check.detectable_in_source, (
+                f"源文件检不出 {check.needle!r} —— 搜索域无鉴别力，"
+                f"该断言会空转（这正是修 L3 的原因）"
+            )
+            assert not check.residue_in_output, (
+                f"{check.needle!r} 以 {check.output_counts} 残留在"
+                f"对象 {check.output_xrefs}"
+            )
 
     def test_占位符已写入(self, tmp_path):
         src = make_pdf(tmp_path / "t.pdf")
@@ -428,8 +458,12 @@ class TestRedaction:
         assert "13800138000" not in text, "5 处应全部删除"
         assert text.count("[手机号]") == 5, f"应写入 5 个占位符，实际 {text.count('[手机号]')}"
         d.close()
-        raw = out.read_bytes()
-        assert raw.count("13800138000".encode("utf-8")) == 0
+        # L3 用差分验证，不用"原始字节搜明文"（那是空转断言，见 test_pdf_verify.py）
+        from redactor.handlers.pdf_verify import verify_residue
+
+        check = verify_residue(pdf, out, ["13800138000"])[0]
+        assert check.detectable_in_source, "源应可检出"
+        assert check.ok, check.describe()
 
     def test_多页PDF逐页处理(self, tmp_path):
         pdf = tmp_path / "multi.pdf"
@@ -511,7 +545,7 @@ class TestRedaction:
     def test_同一span内多个命中的占位符不重叠(self, tmp_path):
         """整行只有 1 个 span 时，同行多个命中必须错开写入。
 
-        实测踩过：整行 1 个 span（``'重复出现：13800138000 与13800138000'``）
+        实测踩过：整行 1 个 span（``'重复：13800138000 与 13800138000'``）
         里两个手机号命中同一span，若都按合并矩形写占位符，
         会写到**同一位置**，渲染图上只剩一个。
         修法是占位符按子串位置定位（``placeholder_anchor``）。

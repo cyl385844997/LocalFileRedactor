@@ -74,6 +74,13 @@ class Match:
 
     注意：本对象含 ``raw``（原文），属于敏感数据，**禁止写入报告或日志**。
     报告中只能使用 ``rule_name`` / ``placeholder`` / 位置信息。
+
+    Attributes:
+        page_index: 所在页的 **0 起**下标；非分页载体恒为 0。
+
+            分页载体（PDF）**必须**填这个值：``start`` 是页内偏移，
+            两页同布局会产生相同的 ``start``，只用 ``(rule_name, start)``
+            当键会互相覆盖，导致报告少报（实测 3 页同布局只报 1 处）。
     """
 
     rule_name: str
@@ -81,6 +88,7 @@ class Match:
     start: int
     end: int
     raw: str
+    page_index: int = 0
 
 
 @dataclass(frozen=True)

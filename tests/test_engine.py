@@ -197,10 +197,17 @@ class TestEngineGuards:
             RedactionEngine([])
 
     def test_aggregate不泄漏原文(self, engine):
-        """报告统计必须零敏感内容（补充约束 2）。"""
+        """报告统计必须零敏感内容（补充约束 2）。
+
+        ``locations`` 必须为**每一个**命中提供标签：``aggregate`` 的
+        ``strict`` 守卫会在取不到标签时抛错（防"键不一致 -> 静默少报"）。
+        本用例两个命中（手机号 + 邮箱）故给两个标签。
+        """
         text = f"手机 {FAKE_PHONE_1} 邮箱 {FAKE_EMAIL}"
         _, matches = engine.redact(text)
-        locations = {("手机号", matches[0].start): "第 1 行"}
+        locations = {
+            (m.rule_name, m.start): "第 1 行" for m in matches
+        }
         stats = engine.aggregate(matches, locations)
 
         blob = str(stats)

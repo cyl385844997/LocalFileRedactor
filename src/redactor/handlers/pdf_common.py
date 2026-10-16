@@ -7,15 +7,15 @@
     PDF 没有"段落/字符偏移"的概念，命中定位只能靠**矩形**。
     而现有 :class:`~redactor.core.models.Match` 用的是 ``start``/``end``
     字符偏移 —— 两者语义不同，不能混用。本模块负责把"矩形命中"
-    翻译成引擎认得的 :class:`Match`（用**页内全局字符偏移**当 key，
-    满足 :meth:`RedactionEngine.aggregate` 的 ``(rule_name, start)`` 契约），
+    翻译成引擎认得的 :class:`Match`（用**页内全局字符偏移**当 key），
     同时保留原始矩形供 redaction 使用。
 
 实测得到的三条硬约束（代码里已按此设计，勿改）：
 
 1. **一个 span 可能只含 1 个字**
-   真实 PDF 里 ``span(text='年')`` 单独成块。因此不能用"整个页面拼成
-   一个大字符串再跑find()" 的做法——那样算出的偏移无法映射回矩形。
+   真实 PDF（尤其排版软件输出）里 ``span(text='年')`` 会单独成块。
+   因此不能用"整个页面拼成一个大字符串再跑find()" 的做法——
+   那样算出的偏移无法映射回矩形。
 
 2. **表格文字在 ``get_text()`` 里被串成连续文本**
    ``'科技研发部陈彦霖报销...差旅费\\n3,106.64\\n银行存款'``，
@@ -48,8 +48,10 @@ class SpanInfo:
         text: span 文本。**可能只有 1 个字**（见模块 docstring 实测 1）。
         font: 字体名。
         size: 字号。
-        offset: 该 span 文本在"页内全局字符串"中的 ``[start, end)``。
-            用于生成 :class:`Match`，保证 ``aggregate`` 的 key 唯一。
+        offset: 该 span 文本在"页内全局字符串"中的起始偏移。
+            用于生成 :class:`Match` 的 ``start``（页内偏移）。
+            注意跨页会撞键，故位置键必须是含页码的三元组，
+            见 :func:`redactor.handlers.pdf_handler.location_key`。
     """
 
     bbox: Rect
@@ -78,9 +80,9 @@ class TextBoxHit:
         covering_spans: 与该命中的全局偏移区间有交叠的**全部** span。
 
             **这是 PDF 相对 docx 的核心差异**：PDF 里一个 span 可能只有
-            1 个字（实测真实 PDF 中'年'/'月'/'日'各自独立成span），
-            11 位手机号会横跨多个 span。若只涂起始 span，就只盖住 1/11 ——
-            这是**漏脱敏**。故落盘时必须取所有 covering_spans 的并集矩形。
+            1 个字，11 位手机号会横跨多个 span。若只涂起始 span，
+            就只盖住 1/11 —— 这是**漏脱敏**。
+            故落盘时必须取所有 covering_spans 的并集矩形。
     """
 
     rule_name: str
@@ -222,8 +224,9 @@ def merge_overlapping_rects(rects: Sequence[Rect]) -> List[Rect]:
 
 
 #: 占位符写入使用的内置 CJK 字体名。
-#:实测：``'china-s'`` 内置可用，零配置、不增大文件；
-#: ``'simsun'`` 会报 ``need font file or buffer``，需显式传字体文件。
+#: 实测（``.verify/probe_claims2.py``）：``'china-s'`` 内置可用，
+#: 零配置、不增大文件；``'simsun'`` 报
+#: ``need font file or buffer``，需显式传字体文件。
 CJK_FONT = "china-s"
 
 
@@ -263,10 +266,10 @@ def placeholder_anchor(hit: "TextBoxHit") -> Rect:
     """占位符的**写入起点**——落在命中子串的实际位置上。
 
     为什么不能用 :func:`rects_for_hits` 的合并矩形当写入框：
-        整行只有 1 个 span 时（实测真实 PDF 里很常见，如
-        ``'重复出现：13800138000 与13800138000'``），两个手机号会命中
-        **同一个 span**，合并出的矩形相同 —— 于是两个占位符写到
-        **同一位置**，视觉上只剩一个（实测渲染图确认）。
+        整行只有 1 个 span 时（``insert_text`` 一次写入即如此，实测
+        11pt 的 ``'重复：13800138000 与 13800138000'`` 只有 1 个 span），
+        两个手机号会命中**同一个 span**，合并出的矩形相同 —— 于是两个
+        占位符写到**同一位置**，视觉上只剩一个。
 
     折中做法：矩形仍按 span 全宽涂（宁多勿少，保证删净），
     但占位符按**子串在 span 内的字符比例**定位，使其落在原位置附近。
@@ -278,6 +281,102 @@ def placeholder_anchor(hit: "TextBoxHit") -> Rect:
     x0 = span.bbox.x0 + span_width * frac0
     # 至少留出与占位符等宽的空间，避免贴到行尾
     return Rect(x0, span.bbox.y0, span.bbox.x1 + span_width * 0.5, span.bbox.y1)
+
+
+@dataclass(frozen=True)
+class CellLocation:
+    """一个表格单元格的位置。
+
+    Attributes:
+        row: **0起**行号。
+        col: **0 起**列号。
+        rect: 单元格矩形。
+    """
+
+    row: int
+    col: int
+    rect: Rect
+
+    def label(self) -> str:
+        """面向用户的位置描述（行 列均按 1 起）。"""
+        return f"第 {self.row + 1} 行第 {self.col + 1} 列"
+
+
+def locate_cells(page: "fitz.Page") -> List[CellLocation]:
+    """识别页面上的表格单元格，返回逐个单元格的位置。
+
+    PDF 规范里**没有表格概念**——表格只是"画了线的文字块"。
+    但 PyMuPDF 1.28 的 :meth:`Page.find_tables` 能在有框线的表格上
+    还原行列结构（合成 3x2 框线表格样本实测识别出 2 行 2 列，
+    见 ``.verify/probe_api_claims.py``）。
+
+    局限（已知）：
+        - 无线框的表格识别率未验证，可能漏
+          （合成无框线样本实测返回 0 个表）
+        - ``find_tables()`` 会往 stderr 打一行
+          ``Consider using the pymupdf_layout package...`` 的提示
+
+    因此本函数**失败时返回空列表**，由调用方降级为"只报页码"，
+    绝不因为表格识别失败而影响脱敏本身。
+
+    Args:
+        page: PyMuPDF 页面。
+
+    Returns:
+        单元格列表；识别不到时为空。
+    """
+    try:
+        finder = page.find_tables()
+    except Exception:
+        # 表格识别是"锦上添花"，失败不能影响脱敏
+        return []
+    tables = getattr(finder, "tables", None) or []
+    cells: List[CellLocation] = []
+    for table in tables:
+        rows = getattr(table, "rows", None) or []
+        for row_index, row in enumerate(rows):
+            row_cells = getattr(row, "cells", None) or []
+            for col_index, cell in enumerate(row_cells):
+                if not cell:
+                    continue          # 合并单元格/不规则表格的空洞
+                try:
+                    cells.append(
+                        CellLocation(row_index, col_index, Rect(cell))
+                    )
+                except Exception:
+                    continue
+    return cells
+
+
+def cell_for_rect(
+    cells: Sequence[CellLocation],
+    rect: Rect,
+    *,
+    margin: float = 2.0,
+) -> Optional[CellLocation]:
+    """找出包含 ``rect`` 的单元格。
+
+    用**中心点**判定并留一点余量：命中矩形可能略微溢出单元格边界
+    （如占位符比原词宽），按严格包含会漏判。
+
+    Args:
+        cells: :func:`locate_cells` 的结果。
+        rect: 待判定的矩形（通常是命中的合并矩形）。
+        margin: 中心点判定的容差（pt）。
+
+    Returns:
+        命中的单元格；不在任何单元格内时返回 ``None``。
+    """
+    if not cells:
+        return None
+    cx = (rect.x0 + rect.x1) / 2.0
+    cy = (rect.y0 + rect.y1) / 2.0
+    for cell in cells:
+        r = cell.rect
+        if (r.x0 - margin) <= cx <= (r.x1 + margin) and \
+           (r.y0 - margin) <= cy <= (r.y1 + margin):
+            return cell
+    return None
 
 
 def write_placeholder(
@@ -293,16 +392,18 @@ def write_placeholder(
     **不抛异常**，只返回负数（剩余空间不足量），静默不写。开发时因此
     出现过"占位符 0 处"的假成功。
 
-    实测数据（11pt 宽的原框 + ``[甲方单位名称]``）：
-        原尺寸      -> -83.41放不下
-        加宽 2x     -> -36.30   仍放不下
-        加宽加高    ->   8.03   成功
+    实测数据（11pt 宽的 ``'甲'`` 命中框 + ``[甲方单位名称]``，
+    见 ``.verify/probe_claim_audit.py``）：
+
+        原尺寸      -> -83.41  放不下
+        加宽 2x     -> -24.52  仍放不下
+        加宽加高    ->  +0.45  成功
 
     Args:
         page: 目标页面。
         rect: 期望写入的位置。
         text: 占位符文本。
-        page_rect: 页面边界，用于裁剪避免写���页面之外。
+        page_rect: 页面边界，用于裁剪避免写到页面之外。
 
     Returns:
         True 表示写入成功；False 表示所有尝试都失败（**调用方必须处理**）。
@@ -348,6 +449,9 @@ __all__ = [
     "merge_overlapping_rects",
     "rects_for_hits",
     "placeholder_anchor",
+    "CellLocation",
+    "locate_cells",
+    "cell_for_rect",
     "write_placeholder",
     "CJK_FONT",
 ]

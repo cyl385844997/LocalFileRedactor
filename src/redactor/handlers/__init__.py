@@ -6,7 +6,7 @@
     P0  txt_handler   纯文本
     P1  docx_handler  Word 正文段落（含跨 run 匹配）
     P2  xlsx_handler  待实现
-    P3  pdf_handler   待实现
+    P3  pdf_handler   文本层 PDF（扫描件明确报错，不做 OCR）
 """
 
 from __future__ import annotations
