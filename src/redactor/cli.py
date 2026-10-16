@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from redactor.core.engine import RedactionEngine
-from redactor.core.models import FileResult, RuleError
+from redactor.core.lexicon import LexiconEntry, default_lexicon_path, load_lexicon
+from redactor.core.models import FileResult, Rule, RuleError
 from redactor.core.rules import load_rule_dir, load_rules
 from redactor.handlers import get_handler, supported_extensions
 from redactor.handlers.base import HandlerError
@@ -129,7 +130,51 @@ def _build_engine(args: argparse.Namespace) -> RedactionEngine:
     if not rules:
         raise RuleError("没有生效的规则，拒绝执行（宁可不脱敏，也不能静默放行）")
 
-    return RedactionEngine(rules, force_numbered=args.numbered)
+    lexicon_entries = _load_lexicon_if_requested(args, rules)
+
+    return RedactionEngine(
+        rules,
+        force_numbered=args.numbered,
+        lexicon_entries=lexicon_entries,
+    )
+
+
+def _load_lexicon_if_requested(
+    args: argparse.Namespace,
+    rules: List[Rule],
+) -> Optional[List[LexiconEntry]]:
+    """按 CLI 参数决定是否加载词库，返回条目列表（不启用时返回空列表）。
+
+    加载顺序（优先级由高到低）：
+      1. 显式 ``--lexicon <路径>`` -> 必须存在，找不到直接报错
+      2. ``--no-lexicon`` -> 明确禁用，连默认词库也不看
+      3. 默认 ``~/.redactor/lexicon.yaml`` -> 不存在属正常，静默跳过
+
+    Args:
+        args: 已解析的命令行参数。
+        rules: 已加载的正则规则，用于给词库条目名做冲突检查。
+
+    Returns:
+        词库条目列表；未启用时返回空列表（引擎会跳过造识别器）。
+
+    Raises:
+        RuleError: 显式指定的文件不存在、加载或校验失败。
+    """
+    explicit = getattr(args, "lexicon", None)
+    no_lexicon = getattr(args, "no_lexicon", False)
+
+    if explicit:
+        # 显式指定却找不到 => 报错。静默放行等于脱敏失效，
+        # 而用户会以为已经脱敏。
+        return load_lexicon(explicit, reserved_names=[r.name for r in rules])
+
+    if no_lexicon:
+        return []
+
+    default_path = default_lexicon_path()
+    if default_path is None:
+        return []
+    return load_lexicon(default_path, reserved_names=[r.name for r in rules])
 
 
 def _process_one(
@@ -233,6 +278,36 @@ def _cmd_rules(args: argparse.Namespace) -> int:
         if rule.description:
             print(f"    说明：{rule.description}")
     print("-" * 70)
+
+    # 词库：与规则同样重要（一起决定脱敏范围），但**只列条目名与词数，
+    # 绝不打印词条本身**——词条就是敏感清单，打到 stdout 等于泄露。
+    lex_entries = _load_lexicon_if_requested(args, rules)
+    default_lex = default_lexicon_path() if not getattr(args, "lexicon", None) \
+        and not getattr(args, "no_lexicon", False) else None
+    print("")
+    if lex_entries:
+        source = args.lexicon or str(default_lex)
+        print(f"自定义词库：{source}")
+        print(f"条目总数：{len(lex_entries)}")
+        print("-" * 70)
+        for entry in lex_entries:
+            state = "启用" if entry.enabled else "禁用"
+            count = len(entry.normalized)
+            print(f"[{entry.name}] -> {entry.placeholder}    {state}    词条 {count} 条")
+            if entry.note:
+                print(f"    说明：{entry.note}")
+            print(f"    行号：{entry.line}")
+        print("-" * 70)
+        print("提示：词条内容不显示，避免敏感词泄露到终端或日志。")
+    else:
+        reason = (
+            "已用 --no-lexicon 禁用"
+            if getattr(args, "no_lexicon", False)
+            else "未指定且默认词库不存在"
+        )
+        print(f"自定义词库：未启用（{reason}）")
+
+    print("-" * 70)
     print(f"已支持的文件类型：{', '.join(supported_extensions())}")
     return 0
 
@@ -257,6 +332,19 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("inputs", nargs="+", help="待处理的文件或目录（可多个）")
         sub.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIRNAME, help=f"输出根目录（默认 {DEFAULT_OUTPUT_DIRNAME}/）")
         sub.add_argument("--rules", help="规则文件或规则目录（默认使用内置 rules/）")
+        sub.add_argument(
+            "--lexicon",
+            help=(
+                "自定义词库文件（默认 ~/.redactor/lexicon.yaml，不存在则不启用）。"
+                "显式指定而文件不存在会直接报错，不静默放行——"
+                "静默放行等于用户以为脱敏了其实没有"
+            ),
+        )
+        sub.add_argument(
+            "--no-lexicon",
+            action="store_true",
+            help="忽略默认词库 ~/.redactor/lexicon.yaml（即使它存在也不加载）",
+        )
         sub.add_argument("--only", nargs="+", help="只启用指定名称的规则")
         sub.add_argument("--numbered", action="store_true", help="强制使用编号占位符（如 [手机号#1]，会暴露同一性，默认关闭）")
         sub.add_argument("-r", "--recursive", action="store_true", help="递归处理子目录")
@@ -272,8 +360,17 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(dry_parser)
     dry_parser.set_defaults(func=_cmd_run, dry_run=True, overwrite_output=False)
 
-    rules_parser = subparsers.add_parser("rules", help="列出当前生效的规则")
+    rules_parser = subparsers.add_parser("rules", help="列出当前生效的规则与词库条目")
     rules_parser.add_argument("--rules", help="规则文件或规则目录（默认使用内置 rules/）")
+    rules_parser.add_argument(
+        "--lexicon",
+        help="自定义词库文件（默认 ~/.redactor/lexicon.yaml，不存在则不启用）",
+    )
+    rules_parser.add_argument(
+        "--no-lexicon",
+        action="store_true",
+        help="忽略默认词库 ~/.redactor/lexicon.yaml",
+    )
     rules_parser.set_defaults(func=_cmd_rules)
 
     return parser
