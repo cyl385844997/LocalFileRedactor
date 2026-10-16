@@ -17,14 +17,19 @@ out/
 # 探测目录（开发期临时产物，一律不入库）
 *_probe/
 probe/
+temp/
+我的测试输出/
 
 # 验证产物目录（.verify/：测试输出、报告样本、临时 docx，一律不入库）
 .verify/
 
-# pytest / 工具缓存
+# pytest 缓存与临时目录（basetemp 已在 pyproject.toml 固定为 pytest_tmp/）
+# pytest 缓存与临时目录
+# pytest_tmp/ 是 scripts/test.bat 传入 --basetemp 的目标目录
 .pytest_cache/
 .pytest_tmp/
-# pytest --basetemp 自定义目录（本项目测试用 .pt_* 命名）
+pytest_tmp/
+# 历史用法：曾用 .pt_* 作为 --basetemp 目录名
 .pt_*/
 .coverage
 htmlcov/

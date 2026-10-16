@@ -48,5 +48,13 @@ where = ["src"]
 # 让测试无需安装即可导入 src/redactor
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = ["-q", "-p", "no:cacheprovider"]
 filterwarnings = ["error::DeprecationWarning:redactor.*"]
+# 注意：**不要**在这里写 basetemp。
+# pytest 9.x 不接受 basetemp 作为 ini 配置项，会报
+# "PytestConfigWarning: Unknown config option: basetemp" 并静默忽略，
+# 临时目录仍回落到 %TEMP%（本机 E:\Temp 权限被拒 → WinError 5）。
+# 它只能通过命令行传入，故用 scripts/test.bat 统一封装：
+#     scripts\test.bat            跑全部测试
+#     scripts\test.bat -k 边界     其余参数透传
+# basetemp 指向的 pytest_tmp/ 已在 .gitignore 中排除。

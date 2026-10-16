@@ -513,15 +513,16 @@ class TestEngineCompatibility:
         )
         assert RedactionEngine(rules) is not None
 
-    def test_词库不参与匹配_首版已知限制(self):
-        """首版词库只加载不匹配，故文本里的词库词**不应**被脱敏。
-        这条测试锁住现状，模块 2 接入识别器后应改成"应当被脱敏"。"""
+    def test_词库参与匹配(self):
+        """模块 2 起，词库词应当被脱敏，且与内置正则同时生效。"""
         entries = load_lexicon_from_text(BASIC, path=Path("<t>"))
         engine = self._engine(lexicon_entries=entries)
         text = "本项目甲方为重庆某某水务，联系人电话13800138000。"
         redacted, matches = engine.redact(text)
-        assert "重庆某某水务" in redacted, "首版词库不参与匹配"
+        assert "重庆某某水务" not in redacted, "词库词应被脱敏"
+        assert "[甲方单位]" in redacted
         assert "13800138000" not in redacted, "内置正则仍然生效"
+        assert {m.rule_name for m in matches} == {"甲方单位", "手机号"}
 
     def test_词库为空时脱敏结果与不传参数一致(self):
         text = "联系人张三，电话13800138000，邮箱a@example.com。"
@@ -538,6 +539,50 @@ class TestEngineCompatibility:
         entries = load_lexicon_from_text(BASIC, path=Path("<t>"))
         engine = self._engine(lexicon_entries=entries)
         assert all(e.name not in engine._priority for e in entries)
+
+
+class TestReservedNames:
+    """条目名不得与内置规则同名。"""
+
+    def test_与内置规则同名报错(self, tmp_path):
+        """占位符会完全相同（[手机号]），报告无法分辨来源，必须拦下。"""
+        text = "lexicon:\n  - name: 手机号\n    words: [某某公司]\n"
+        with pytest.raises(RuleError) as exc:
+            load_lexicon_from_text(
+                text, path=Path("<t>"), reserved_names=["手机号", "邮箱"]
+            )
+        message = str(exc.value)
+        assert "与内置规则同名" in message
+        assert "手机号" in message
+        assert "第 2 行" in message
+
+    def test_对全部内置规则名生效(self, tmp_path):
+        names = ["手机号", "身份证号", "银行卡号", "邮箱", "IP地址"]
+        for rn in names:
+            text = f"lexicon:\n  - name: {rn}\n    words: [某某]\n"
+            with pytest.raises(RuleError):
+                load_lexicon_from_text(text, path=Path("<t>"), reserved_names=names)
+
+    def test_不冲突的名字放行(self):
+        text = "lexicon:\n  - name: 甲方单位\n    words: [某某]\n"
+        entries = load_lexicon_from_text(
+            text, path=Path("<t>"), reserved_names=["手机号", "邮箱"]
+        )
+        assert entries[0].name == "甲方单位"
+
+    def test_不传reserved_names则不校验(self):
+        """保持旧调用方式可用（不传即不做这项校验）。"""
+        text = "lexicon:\n  - name: 手机号\n    words: [某某公司]\n"
+        entries = load_lexicon_from_text(text, path=Path("<t>"))
+        assert entries[0].name == "手机号"
+
+    def test_内置规则名相同时load_lexicon也拦下(self, tmp_path):
+        path = write_lexicon(
+            tmp_path, "lexicon:\n  - name: 邮箱\n    words: [某某]\n"
+        )
+        with pytest.raises(RuleError) as exc:
+            load_lexicon(path, reserved_names=["邮箱"])
+        assert "与内置规则同名" in str(exc.value)
 
 
 # ============================================================== 8. 端到端

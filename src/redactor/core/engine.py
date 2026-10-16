@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from redactor.core.lexicon import LexiconEntry
 from redactor.core.models import HitStat, Match, Rule
 from redactor.recognizers.base import Recognizer
+from redactor.recognizers.lexicon_recognizer import build_lexicon_recognizer
 from redactor.recognizers.regex_recognizer import build_recognizer
 from redactor.redactors.replacer import PlaceholderReplacer, resolve_overlaps
 
@@ -43,11 +44,23 @@ class RedactionEngine:
         self._rules: List[Rule] = list(rules)
         self._lexicon_entries: List[LexiconEntry] = list(lexicon_entries or [])
         self._recognizers: List[Recognizer] = [build_recognizer(rule) for rule in self._rules]
-        # TODO(模块 2): 在这里为 self._lexicon_entries 追加 LexiconRecognizer，
-        #   位置必须在末尾 —— priority 由规则在列表中的下标决定，
-        #   追加到末尾才能保证词库优先级低于全部内置正则。
+        # 词库识别器**只造一个**，内部所有条目共用一台自动机、一次扫描产出全部命中。
+        #
+        # 切勿改成"每条目一个识别器"：那样文本仍会被扫 N 遍，
+        # 只省了自动机构建，复杂度几乎不变，等于没改。
+        #
+        # 位置必须在【末尾】：priority 由规则在列表中的下标决定
+        # （见 self._priority），末尾即最低优先级，从而保证词库在同起点
+        # 冲突时不会压过内置正则规则。
+        if any(entry.enabled for entry in self._lexicon_entries):
+            self._recognizers.append(
+                build_lexicon_recognizer(self._lexicon_entries)
+            )
         # 编号分配器必须是"每次任务一个"，否则编号会跨文件延续
         self._replacer = PlaceholderReplacer(self._rules, force_numbered=force_numbered)
+        # 词库条目名不进入 _priority：它们不在 PlaceholderReplacer 的规则表里，
+        # 且 resolve_overlaps 查不到时返回默认值 9999（永远垫底），
+        # 这正是"词库优先级低于内置正则"所要求的行为。
         self._priority: Dict[str, int] = {rule.name: i for i, rule in enumerate(self._rules)}
 
     @property

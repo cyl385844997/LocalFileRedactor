@@ -18,9 +18,11 @@
    归一化只做两条映射（见 :func:`normalize_word`），都是 1:1 替换，
    因此**归一化文本的偏移量等于原文偏移量**，可直接用于定位替换。
 
-4. **复用 rules.py 的底层工具**
-   ``_compose_and_load`` / ``_index_lines`` / ``_require_str`` / ``_require_bool``
-   直接借用，不另造一套 YAML 解析，避免两份行号定位逻辑漂移。
+4. **复用 core/yaml_loader.py**
+   双树解析、行号索引、字段类型校验等能力与 ``rules.py`` 共用同一份实现
+   （``core/yaml_loader.py``），不另造一套 YAML 解析，避免两份行号定位逻辑漂移。
+   早期版本直接 import ``rules._compose_and_load`` 这类私有函数，导致报错文案里
+   出现"规则 '词库条目 'A''"这种双层引号嵌套与领域词错位，现已解除。
    未知字段白名单不复用——``rules._ALLOWED_KEYS`` 是该模块私有常量，
    且语义不同（词库有 ``words``/``note``，没有 ``pattern``）。
 """
@@ -29,15 +31,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from redactor.core.models import RuleError
-from redactor.core.rules import (
-    _compose_and_load,
-    _index_lines,
-    _require_bool,
-    _require_str,
+from redactor.core.yaml_loader import (
     PathKey,
+    compose_and_load,
+    index_lines,
+    read_text,
+    require_bool,
+    require_str,
 )
 
 # 词库条目中允许出现的字段（白名单，出现未知字段即报错，防止拼写错误被忽略）
@@ -172,7 +175,7 @@ def _build_entry(
             path=str(path),
             line=fallback_line,
         )
-    name = _require_str(data.get("name"), line_of("name"), path, "name", label)
+    name = require_str(data.get("name"), line_of("name"), path, "name", label)
 
     label = f"词库条目 '{name}'"
 
@@ -249,10 +252,10 @@ def _build_entry(
         name=name,
         words=tuple(raw_words),
         normalized=tuple(normalized_words),
-        enabled=_require_bool(
+        enabled=require_bool(
             data.get("enabled"), line_of("enabled"), path, "enabled", label, default=True
         ),
-        numbered=_require_bool(
+        numbered=require_bool(
             data.get("numbered"), line_of("numbered"), path, "numbered", label, default=False
         ),
         note=note,
@@ -261,21 +264,31 @@ def _build_entry(
 
 
 # ---------------------------------------------------------------- 公开 API
-def load_lexicon_from_text(text: str, *, path: Path) -> List[LexiconEntry]:
+def load_lexicon_from_text(
+    text: str,
+    *,
+    path: Path,
+    reserved_names: Optional[Iterable[str]] = None,
+) -> List[LexiconEntry]:
     """从 YAML 文本加载词库条目。
 
     Args:
         text: YAML 文本内容。
         path: 用于报错的文件路径（可以是虚拟名，便于测试）。
+        reserved_names: 已被占用的名称集合（通常是内置正则规则名）。
+            词库条目名与之冲突时**直接报错** —— 两者会产生完全相同的占位符
+            （``[手机号]``），报告里无法分辨命中来自哪一方，且priority
+            字典会出现同名项而语义不明。
 
     Returns:
         全部条目（含 ``enabled: false`` 的），保持 YAML 中的顺序。
         是否过滤由调用方决定。
 
     Raises:
-        RuleError: YAML 语法错误、字段非法、条目内重复词等一切问题。
+        RuleError: YAML 语法错误、字段非法、条目内重复词、
+            条目名与内置规则冲突等一切问题。
     """
-    root, data = _compose_and_load(text, path)
+    root, data = compose_and_load(text, path, kind="词库")
 
     if not isinstance(data, dict):
         line = 1
@@ -291,7 +304,7 @@ def load_lexicon_from_text(text: str, *, path: Path) -> List[LexiconEntry]:
             path=str(path),
         )
 
-    lines = _index_lines(root)
+    lines = index_lines(root)
     top_line = lines.get((_TOP_KEY,), 1)
 
     entries_data = data[_TOP_KEY]
@@ -309,6 +322,7 @@ def load_lexicon_from_text(text: str, *, path: Path) -> List[LexiconEntry]:
 
     entries: List[LexiconEntry] = []
     seen_names: Dict[str, int] = {}
+    reserved = set(reserved_names or ())
     # 跨条目去重：同一词挂到两个类别下是正常用法，静默保留首次出现。
     global_seen: Dict[str, str] = {}
     for index, item in enumerate(entries_data):
@@ -321,6 +335,18 @@ def load_lexicon_from_text(text: str, *, path: Path) -> List[LexiconEntry]:
                 line=entry.line,
             )
         seen_names[entry.name] = entry.line
+
+        # ① 条目名不得与内置正则规则同名：
+        #    两者占位符完全相同（[name] 由name 决定），报告里无法分辨来源；
+        #    且引擎 priority 字典以规则名为键，同名会让优先级语义塌陷。
+        if reserved and entry.name in reserved:
+            raise RuleError(
+                f"词库条目名 '{entry.name}' 与内置规则同名（{path} 第 {entry.line} 行）。"
+                f"两者占位符都是 [{entry.name}]，报告会无法分辨命中来源。"
+                f"请换一个条目名。",
+                path=str(path),
+                line=entry.line,
+            )
 
         # 跨条目去重：剔除已在更早条目出现过的词
         kept: List[str] = []
@@ -346,11 +372,17 @@ def load_lexicon_from_text(text: str, *, path: Path) -> List[LexiconEntry]:
     return entries
 
 
-def load_lexicon(path: str | Path) -> List[LexiconEntry]:
+def load_lexicon(
+    path: str | Path,
+    *,
+    reserved_names: Optional[Iterable[str]] = None,
+) -> List[LexiconEntry]:
     """从 YAML 文件加载词库条目（**不过滤** ``enabled``）。
 
     Args:
         path: 词库文件路径。
+        reserved_names: 已被占用的名称集合（通常传内置规则名），
+            用于阻止词库条目名与内置规则冲突。
 
     Returns:
         词库条目列表（保持 YAML 顺序）。
@@ -358,18 +390,9 @@ def load_lexicon(path: str | Path) -> List[LexiconEntry]:
     Raises:
         RuleError: 文件不存在、编码错误、YAML 语法错误、字段非法等。
     """
-    lex_path = Path(path)
-    if not lex_path.is_file():
-        raise RuleError(f"词库文件不存在：{lex_path}", path=str(lex_path))
+    text, lex_path = read_text(path, kind="词库")
 
-    try:
-        text = lex_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise RuleError(f"词库文件不是 UTF-8 编码：{lex_path}", path=str(lex_path)) from exc
-    except OSError as exc:
-        raise RuleError(f"词库文件读取失败：{lex_path}（{exc}）", path=str(lex_path)) from exc
-
-    return load_lexicon_from_text(text, path=lex_path)
+    return load_lexicon_from_text(text, path=lex_path, reserved_names=reserved_names)
 
 
 def default_lexicon_path() -> Optional[Path]:
