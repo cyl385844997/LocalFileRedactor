@@ -20,6 +20,9 @@
 2. **表格文字在 ``get_text()`` 里被串成连续文本**
    ``'科技研发部陈彦霖报销...差旅费\\n3,106.64\\n银行存款'``，
    没有单元格边界。要拿行列号必须用 :meth:`Page.find_tables`。
+   **但只有框线表格的行列号可信**（P2 实测）：无框线表格用 ``text``
+   策略虽能"识别"，行结构却膨胀且两口径矛盾，且无法与目录页/
+   参数清单/编号列表区分。详见 :func:`locate_cells`。
 
 3. **多栏时 ``get_text()`` 按 Y 坐标交替串栏**
    左栏第 1 行、右栏第 1 行、左栏第 2 行……不是"先左后右"。
@@ -28,8 +31,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import fitz  # PyMuPDF
 
@@ -302,19 +307,104 @@ class CellLocation:
         return f"第 {self.row + 1} 行第 {self.col + 1} 列"
 
 
+@contextlib.contextmanager
+def _silence_native_noise() -> Iterator[None]:
+    """在 fd 级重定向 stdout/stderr，吞掉 PyMuPDF 的 C 层提示。
+
+    **为什么不能用 ``contextlib.redirect_stderr``**（实测，勿改回）：
+
+        with contextlib.redirect_stderr(io.StringIO()) as buf:
+            page.find_tables()
+        # buf.getvalue() == ''   <- 一个字都没捕获到
+
+    **它写的是 stdout，不是 stderr**（实测，勿想当然）：
+
+        subprocess.run([python, "-c", "import fitz; fitz.open().new_page().find_tables()"],
+                       capture_output=True)
+        # stdout == 'Consider using the pymupdf_layout package...\\n'
+        # stderr == ''
+
+    这个结论是**变异实验逼出来的**：最初版本只重定向 fd 2，结果
+    "去掉静音"的变异实验**没有让测试失败**，才发现静音根本没生效
+    （详见 ``.verify/probe_p2/probe_p2_mutation.txt`` 的 M3）。
+    当时的探针用 ``redirect_stderr`` 捕获不到，就误判成"写 fd 2"——
+    **探针的推断同样可能错**，必须用 fd 级捕获交叉验证。
+
+    故这里 **fd 1 与 fd 2 一起**重定向到 ``os.devnull``：PyMuPDF 不同
+    版本可能写不同流，两个都盖住才不会漏。无论是否发生异常都在
+    ``finally`` 里恢复，避免把整个进程的输出永久吞掉。
+    """
+    saved: Dict[int, int] = {}
+    devnull = -1
+    try:
+        for fd in (1, 2):
+            try:
+                saved[fd] = os.dup(fd)
+            except OSError:
+                pass
+        if not saved:
+            # 极端环境（无 fd 1/2）下不冒险，直接放行
+            yield
+            return
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        for fd in saved:
+            os.dup2(devnull, fd)
+        yield
+    finally:
+        for fd, backup_fd in saved.items():
+            try:
+                os.dup2(backup_fd, fd)
+            finally:
+                os.close(backup_fd)
+        if devnull >= 0:
+            os.close(devnull)
+
+
 def locate_cells(page: "fitz.Page") -> List[CellLocation]:
     """识别页面上的表格单元格，返回逐个单元格的位置。
 
     PDF 规范里**没有表格概念**——表格只是"画了线的文字块"。
-    但 PyMuPDF 1.28 的 :meth:`Page.find_tables` 能在有框线的表格上
-    还原行列结构（合成 3x2 框线表格样本实测识别出 2 行 2 列，
-    见 ``.verify/probe_api_claims.py``）。
+    PyMuPDF 的 :meth:`Page.find_tables` 能在**有框线**的表格上还原
+    行列结构（合成 4x3 框线表格实测识别出 4 行 3 列，``extract()``
+    逐格与肉眼一致，见 ``.verify/probe_p2/probe_p2_strategies.txt``）。
+
+    🔴 **为什么只用 ``lines`` 策略、不用 ``text`` 策略**（P2 核心结论）
+    ------------------------------------------------------------------
+    无框线表格用 ``text`` 策略确实"能识别到"，但**行列号不可信**，
+    且**无法区分表格与列表**。两条实测证据（均为本仓库探针产物）：
+
+    1. **行结构膨胀且口径矛盾**（``probe_p2_textrows.txt``）
+       ``text`` 策略把 4 行拆成 7 行，且行框**高度不一致、交错重叠**
+       （行 0 高 10pt，行 1 高 16pt 且跨表头+数据行 1）。于是：
+
+       - 按 ``table.extract()``（单元格 rect）看 → 偶数行是 ``['','','']``
+       - 按 ``row.bbox`` 取文本看 → **每行都能捞到字，一行都滤不掉**
+
+       两个口径给出**不同的行号**，用户无从判断该信哪个。
+       "过滤空行"这条路因此走不通。
+
+    2. **纯文本判据无法区分表格与列表**（``probe_p2_adversarial.txt``）
+       实测 4 条判据（有数值列 / 平均字数短 / 无句读 / 首行像表头）
+       在对抗性反例上**全部失效**，最强组合仍把下列非表格判成表格：
+
+       - 目录页 ``第一章 项目概况 / 1``
+       - 编号列表 ``1 项目概况``
+       - 参数清单 ``扬程 12.5 / 流量 800``
+       - 联系方式块 ``单位 重庆某某水务 / 电话 13800138000``
+
+       其中"有数值列"反而**最容易骗**——目录页码、参数值、电话号码
+       全是"数值"。
+
+    **取舍（路线 A：宁可少给信息，不给错信息）**：
+    有框线 → 给行列号；无框线 → **不猜**，由调用方降级为"只报页码"。
+    给一个"看似精确、实际是错的"行列号，比"识别不到"危害更大——
+    用户不会去核对，而错的行列号会让其去 PDF 里找一个不存在的位置。
 
     局限（已知）：
-        - 无线框的表格识别率未验证，可能漏
-          （合成无框线样本实测返回 0 个表）
-        - ``find_tables()`` 会往 stderr 打一行
-          ``Consider using the pymupdf_layout package...`` 的提示
+        - 无框线的表格（三线表、纯文本对齐）**拿不到行列号**，
+          这是有意为之的产品级降级，不是缺陷
+        - ``find_tables()`` 会往 stderr 打一行 C 层提示，
+          已由 :func:`_silence_native_noise` 在 fd 级吞掉
 
     因此本函数**失败时返回空列表**，由调用方降级为"只报页码"，
     绝不因为表格识别失败而影响脱敏本身。
@@ -326,7 +416,14 @@ def locate_cells(page: "fitz.Page") -> List[CellLocation]:
         单元格列表；识别不到时为空。
     """
     try:
-        finder = page.find_tables()
+        # 注意：vertical/horizontal 都显式传 'lines'。
+        # 不传的话虽然默认也是 'lines'，但这里显式写出是为了让
+        # "不用 text 策略"这个决定在代码里可见、可检索、可被测试锁定。
+        with _silence_native_noise():
+            finder = page.find_tables(
+                vertical_strategy="lines",
+                horizontal_strategy="lines",
+            )
     except Exception:
         # 表格识别是"锦上添花"，失败不能影响脱敏
         return []

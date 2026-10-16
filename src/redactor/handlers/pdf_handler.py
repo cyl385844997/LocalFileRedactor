@@ -28,6 +28,9 @@
     P1.3 redaction + 占位符写入
     P1.4 表格定位
     P1.5 报告集成
+    P2   表格识别分级：有框线给行列号，无框线只给页码 + 坐标
+         （**不给无框线表格的行列号** —— 实测无法可靠判断，详见
+         :func:`~redactor.handlers.pdf_common.locate_cells` 的说明）
 """
 
 from __future__ import annotations
@@ -125,7 +128,10 @@ class PdfHandler(BaseHandler):
                     f"请提供已解密的文件：{source}",
                 )
 
-            all_hits, stats, locations = self._scan(doc, engine, source)
+            all_hits, stats, locations, diagnostics = self._scan(
+                doc, engine, source
+            )
+            loc_note = self.describe_location_mode(diagnostics)
 
             if dry_run:
                 return FileResult(
@@ -133,7 +139,10 @@ class PdfHandler(BaseHandler):
                     output=None,
                     status="ok",
                     hits=stats,
-                    message=f"发现 {len(all_hits)} 处命中（dry-run，未写文件）",
+                    message=(
+                        f"发现 {len(all_hits)} 处命中（dry-run，未写文件）"
+                        f"{loc_note}"
+                    ),
                 )
 
             # --- P1.3：真正落盘 ---
@@ -155,7 +164,7 @@ class PdfHandler(BaseHandler):
                 output=str(output),
                 status="ok",
                 hits=stats,
-                message=f"已处理 {len(all_hits)} 处命中{note}",
+                message=f"已处理 {len(all_hits)} 处命中{note}{loc_note}",
             )
         finally:
             doc.close()
@@ -232,7 +241,12 @@ class PdfHandler(BaseHandler):
         source: Path,
         *,
         table_mode: bool = True,
-    ) -> Tuple[List[TextBoxHit], List[HitStat], Dict[Tuple[str, int, int], str]]:
+    ) -> Tuple[
+        List[TextBoxHit],
+        List[HitStat],
+        Dict[Tuple[str, int, int], str],
+        Dict[str, object],
+    ]:
         """逐页扫描，收集全部命中。
 
         Args:
@@ -240,11 +254,18 @@ class PdfHandler(BaseHandler):
             engine: 脱敏引擎。
             source: 源文件路径（用于错误信息）。
             table_mode: 是否尝试识别表格并在位置标签里给出行列号
-                （P1.4）。识别失败会**静默降级**为"只报页码"——
+                （P1.4 / P2）。识别失败会**静默降级**为"只报页码 + 坐标"——
                 表格行列号是附加信息，不能因此影响脱敏本身。
 
         Returns:
-            ``(全部命中, 统计, 位置映射)``。
+            ``(全部命中, 统计, 位置映射, 定位诊断)``。
+
+            定位诊断（``Dict[str, object]``）用于报告区分两种定位模式：
+
+            - ``table_pages``：识别出框线表格的页码（1 起）列表
+            - ``cell_hits``：定位到表格行列号的命中数
+            - ``coord_hits``：只定位到页码 + 坐标的命中数
+            - ``table_mode``：调用时是否开启了表格识别
 
         Raises:
             HandlerError: 存在无文本层页面。
@@ -254,6 +275,9 @@ class PdfHandler(BaseHandler):
         flat_matches: List[Match] = []
         blank_pages: List[int] = []
         hit_seq = 1    # 全文档命中序号，保证位置标签每处唯一
+        cell_hits = 0        # 拿到表格行列号的命中数
+        coord_hits = 0       # 只拿到页码 + 坐标的命中数
+        table_pages: List[int] = []   # 识别出框线表格的页码（1 起）
 
         for page_index in range(doc.page_count):
             page = doc[page_index]
@@ -263,8 +287,10 @@ class PdfHandler(BaseHandler):
                 continue
 
             spans, _ = extract_spans(page)
-            # P1.4：识别表格单元格，失败时降级为"只报页码"，不影响脱敏
+            # P1.4/P2：识别表格单元格，失败时降级为"只报页码 + 坐标"
             cells = locate_cells(page) if table_mode else []
+            if cells:
+                table_pages.append(page_index + 1)
             for span in spans:
                 for recognizer in engine.recognizers:
                     for match in recognizer.find_in_span(span.text, span.offset):
@@ -303,12 +329,31 @@ class PdfHandler(BaseHandler):
                         all_hits.append(hit)
                         flat_matches.append(match)
 
-                        # 位置标签：页码 + 表格行列号（若能定位到单元格）
+                        # --- 位置标签：两种模式（P2 报告集成）---
+                        # 模式一：命中落在**有框线**表格的单元格里 -> 给行列号
+                        # 模式二：其余情况 -> 只给页码 + 命中矩形坐标
+                        #
+                        # 为什么模式二用**命中矩形**而不是"文本块 bbox"：
+                        # 实测（``.verify/probe_p2/probe_p2_blocks.txt``）
+                        # 文本块会**互相重叠** —— 框线表格样本里块 1
+                        # （整行 `1重庆某某水务3106.64`）与块 4（`13800138000`）
+                        # 都包含命中中心，一个命中落进 2 个块。
+                        # 用它做定位会产生歧义，故改用命中矩形本身
+                        # （唯一、精确、且正是实际被涂改的区域）。
+                        hit_rect = rects_for_hits([hit])[0]
                         label = f"第 {page_index + 1} 页"
-                        if cells:
-                            cell = cell_for_rect(cells, rects_for_hits([hit])[0])
-                            if cell is not None:
-                                label += f" {cell.label()}"
+                        cell = (
+                            cell_for_rect(cells, hit_rect) if cells else None
+                        )
+                        if cell is not None:
+                            label += f" {cell.label()}"
+                            cell_hits += 1
+                        else:
+                            label += (
+                                f" 坐标 ({hit_rect.x0:.0f},{hit_rect.y0:.0f})"
+                                f"-({hit_rect.x1:.0f},{hit_rect.y1:.0f})"
+                            )
+                            coord_hits += 1
                         label += f" 第 {hit_seq} 处"
                         # 键必须是三元组 (规则名, 页码, 页内偏移)：
                         # 二元组在跨页同布局时会撞键覆盖，报告少报。
@@ -327,7 +372,45 @@ class PdfHandler(BaseHandler):
             )
 
         stats = engine.aggregate(flat_matches, locations, key_of=location_key)
-        return all_hits, stats, locations
+        diagnostics: Dict[str, object] = {
+            "table_pages": table_pages,
+            "cell_hits": cell_hits,
+            "coord_hits": coord_hits,
+            "table_mode": table_mode,
+        }
+        return all_hits, stats, locations, diagnostics
+
+    @staticmethod
+    def describe_location_mode(diagnostics: Dict[str, object]) -> str:
+        """把定位诊断翻译成报告里的一句话（区分两种模式）。
+
+        为什么要显式说明"没给行列号"：
+            用户看到"第 3 页 坐标 (...)"时，若不解释，会以为工具坏了。
+            实际是**有意的降级**——无框线表格的行列号无法可靠判断
+            （实测目录页/参数清单/两栏正文都会被误判成表格），
+            宁可不给，也不给一个错的。报告必须把这个取舍讲清楚。
+        """
+        if not diagnostics.get("table_mode"):
+            return ""
+        cell_hits = int(diagnostics.get("cell_hits", 0) or 0)
+        coord_hits = int(diagnostics.get("coord_hits", 0) or 0)
+        table_pages = list(diagnostics.get("table_pages", []) or [])
+
+        parts: List[str] = []
+        if cell_hits:
+            pages = "、".join(str(n) for n in table_pages[:5])
+            more = f" 等 {len(table_pages)} 页" if len(table_pages) > 5 else ""
+            parts.append(
+                f"{cell_hits} 处定位到框线表格行列号（第 {pages}{more} 页）"
+            )
+        if coord_hits:
+            parts.append(
+                f"{coord_hits} 处仅给页码与坐标"
+                f"（无框线表格不推断行列号，避免给出错误位置）"
+            )
+        if not parts:
+            return ""
+        return "；定位：" + "，".join(parts)
 
 
 __all__ = ["PdfHandler", "NO_TEXT_LAYER"]
