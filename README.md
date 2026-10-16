@@ -94,6 +94,24 @@
   故**宁可少给信息，也不给错信息**——与 docx 里"域代码段落跳过"
   是同一种判断。脱敏本身**不受任何影响**。
 
+- **`find_tables()` 的原生提示已被静音**（P2 修复，勿改回纯 fd 重定向）
+  `find_tables()` 首次调用时会往 **stdout** 打一行
+  `Consider using the pymupdf_layout package...`。它**写的是 stdout
+  不是 stderr**，且**每进程只打印一次**（与调用次数/页数无关）。
+
+  静音由 `_silence_native_noise()` 完成，三条实测结论
+  （`.verify/probe_p2/silence/`，勿凭直觉改）：
+
+  1. 提示经 **Python 的 `sys.stdout`** 写出，先进**缓冲区**；
+     纯 `dup2` 只改 fd 指向、不 flush，缓冲区内容会在**恢复 fd
+     之后**才落盘 —— 重定向窗口"看起来"盖住了，实际全泄漏。
+  2. 故必须**在恢复 fd 之前 flush**，否则静音无效（这是最初的 bug 根因）。
+  3. 测本函数**必须开全新子进程**：同进程内若前面已裸跑过一次，
+     那唯一一次打印已被消费，再断言"没看到提示"恒真 —— 空转断言。
+
+  实测对照（`probe_silence_fix.txt`）：裸跑 `find_tables` 泄漏 = True，
+  走生产路径 `locate_cells` 泄漏 = **False**。
+
 - **多栏版面**：脱敏结果正确（按矩形处理，不依赖阅读顺序），
   但位置标签里不含栏号。
 - **占位符可能改变版面**：占位符比原串长时会挤占相邻空白区域；
@@ -407,8 +425,8 @@ redactor rules --lexicon D://我的词库.yaml
 报告同理（报告只记规则名、命中数与位置）。
 
 词库相关测试合计 146 项（lexicon 77 + recognizer 50 + CLI 19）；
-PDF 相关 104 项（103 passed + 1 xfailed；含 L3 差分验证与反向对照、
-P2 表格分类与 5 项变异实验）。
+PDF 相关 105 项（104 passed + 1 xfailed；含 L3 差分验证与反向对照、
+P2 表格分类与 6 项变异实验）。
 
 ## 项目结构
 
@@ -432,7 +450,7 @@ LocalFileRedactor/
 
 | 项 | 状态 |
 |---|---|
-| 全部单元测试 | ✅ **620 passed, 1 xfailed**（xfail = 已记录的 /Info 元数据缺口） |
+| 全部单元测试 | ✅ **621 passed, 1 xfailed**（xfail = 已记录的 /Info 元数据缺口） |
 | CLI 冒烟（dry-run / run / 规则加载） | ✅ 通过，退出码正确 |
 | 源文件不变性 | ✅ **SHA-256 前后一致** |
 | 跨 run 识别 | ✅ 拆在 3 个 run 的手机号正确命中 |

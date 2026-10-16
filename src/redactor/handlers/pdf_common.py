@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -309,33 +310,65 @@ class CellLocation:
 
 @contextlib.contextmanager
 def _silence_native_noise() -> Iterator[None]:
-    """在 fd 级重定向 stdout/stderr，吞掉 PyMuPDF 的 C 层提示。
+    """吞掉 PyMuPDF 的 ``pymupdf_layout`` 提示。
 
-    **为什么不能用 ``contextlib.redirect_stderr``**（实测，勿改回）：
+    提示原文::
 
-        with contextlib.redirect_stderr(io.StringIO()) as buf:
-            page.find_tables()
-        # buf.getvalue() == ''   <- 一个字都没捕获到
+        Consider using the pymupdf_layout package for a greatly improved
+        page layout analysis.
 
-    **它写的是 stdout，不是 stderr**（实测，勿想当然）：
+    它是 ``find_tables()`` 第一次被调用时打出来的（**每进程仅一次**），
+    纯属噪音，会污染 CLI 输出与测试断言。
 
-        subprocess.run([python, "-c", "import fitz; fitz.open().new_page().find_tables()"],
-                       capture_output=True)
-        # stdout == 'Consider using the pymupdf_layout package...\\n'
-        # stderr == ''
+    🔴 三条实测结论（``.verify/probe_p2/probe_silence_rootcause.txt``
+    与 ``silence_fix.txt``，均为本仓库探针产物；**勿凭直觉改**）
+    ------------------------------------------------------------------
 
-    这个结论是**变异实验逼出来的**：最初版本只重定向 fd 2，结果
-    "去掉静音"的变异实验**没有让测试失败**，才发现静音根本没生效
-    （详见 ``.verify/probe_p2/probe_p2_mutation.txt`` 的 M3）。
-    当时的探针用 ``redirect_stderr`` 捕获不到，就误判成"写 fd 2"——
-    **探针的推断同样可能错**，必须用 fd 级捕获交叉验证。
+    1. **写的是 stdout，不是 stderr**
 
-    故这里 **fd 1 与 fd 2 一起**重定向到 ``os.devnull``：PyMuPDF 不同
-    版本可能写不同流，两个都盖住才不会漏。无论是否发生异常都在
-    ``finally`` 里恢复，避免把整个进程的输出永久吞掉。
+           subprocess.run([py, "-c", "import fitz; ...find_tables()"],
+                          capture_output=True)
+           # stdout == 'Consider using the pymupdf_layout package...\\n'
+           # stderr == ''
+
+       因此 ``contextlib.redirect_stderr`` 完全无效（实测捕获长度 0）。
+
+    2. **每进程只打印一次**，与调用次数/页数无关
+
+           === 第1次调用 ===   Consider using the pymupdf_layout ...
+           === 第2次调用 ===   （无输出）
+           === 第3次调用（新页）=== （无输出）
+
+       这条直接导致"写用例"极易写成**空转断言**：若同一进程里前面
+       已经裸跑过一次，后面再断言"没看到提示"就**天然成立**，
+       与静音是否生效无关。测本函数**必须开全新子进程**。
+
+    3. **纯 ``dup2`` 挡不住，必须 flush**（最初的 bug 根因）
+
+       提示经 **Python 的 ``sys.stdout``** 写出，内容先进它的**缓冲区**；
+       ``dup2`` 只改 fd 指向、**不 flush**。于是缓冲区内容会在
+       **恢复 fd 之后**才落盘 —— 重定向窗口"看起来"盖住了，实际全泄漏。
+
+       实测对照（子进程内 dup2 到文件）::
+
+           恢复前不 flush -> sink 文件为空，提示出现在真实 stdout  ❌
+           恢复前   flush -> sink 文件有提示，真实 stdout 干净    ✅
+
+       故本函数在**恢复 fd 之前**先 flush ``sys.stdout``/``sys.stderr``。
+
+    做法：把 fd 1 与 fd 2 一起指向 ``os.devnull``，并在恢复前 flush。
+    ``finally`` 里无条件恢复 fd 与 flush，避免永久吞掉进程输出。
     """
     saved: Dict[int, int] = {}
     devnull = -1
+
+    def _flush() -> None:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
     try:
         for fd in (1, 2):
             try:
@@ -347,10 +380,16 @@ def _silence_native_noise() -> Iterator[None]:
             yield
             return
         devnull = os.open(os.devnull, os.O_WRONLY)
+        # 进入静音前先 flush：把此前积压的正常输出落盘，
+        # 否则它们也会被"顺带"写进 devnull 而丢失。
+        _flush()
         for fd in saved:
             os.dup2(devnull, fd)
         yield
     finally:
+        # 关键：恢复 fd **之前** flush，否则缓冲内容会写到恢复后的
+        # 真实 stdout（实测泄漏路径）。
+        _flush()
         for fd, backup_fd in saved.items():
             try:
                 os.dup2(backup_fd, fd)
@@ -403,8 +442,10 @@ def locate_cells(page: "fitz.Page") -> List[CellLocation]:
     局限（已知）：
         - 无框线的表格（三线表、纯文本对齐）**拿不到行列号**，
           这是有意为之的产品级降级，不是缺陷
-        - ``find_tables()`` 会往 stderr 打一行 C 层提示，
-          已由 :func:`_silence_native_noise` 在 fd 级吞掉
+        - ``find_tables()`` 会在**首次调用**时往 **stdout** 打一行
+          ``Consider using the pymupdf_layout package...`` 提示
+          （**不是 stderr**，实测见 :func:`_silence_native_noise`），
+          已由该函数吞掉
 
     因此本函数**失败时返回空列表**，由调用方降级为"只报页码"，
     绝不因为表格识别失败而影响脱敏本身。

@@ -442,61 +442,110 @@ class TestP2RuledOnly:
         d.close()
         assert "13800138000" not in text, "无框线表格里的手机号必须被删掉"
 
-    def test_原生提示被静音_子进程验证(self, tmp_path):
-        """``find_tables()`` 的 C 层提示必须被吞掉（**子进程内**验证）。
+    def test_原生提示被静音(self, tmp_path):
+        """``find_tables()`` 的提示必须被吞掉 —— **两个独立子进程**对照。
 
-        🔴 为什么必须开子进程（实测教训，勿改成同进程 capfd）：
-            PyMuPDF 的提示 **每个进程只在第一次调用时打印一次**，实测：
+        🔴 为什么必须是**两个**子进程（Marvis 复核指出，勿合并成一个）：
+            PyMuPDF 的提示 **每进程只打印一次**。若把"裸跑对照"与
+            "走被测函数"放在**同一个**子进程里，裸跑会先消费掉那唯一
+            一次打印，于是"locate_cells 之后没看到提示"**天然成立**，
+            与静音是否生效毫无关系 —— 用例失去鉴别力（空转断言）。
 
-                === 第1次调用 ===
-                Consider using the pymupdf_layout package ...
-                === 第2次调用 ===      <- 什么都不打
-                === 第3次调用（新页）===  <- 什么都不打
+            本用例上一版正是如此，被 Marvis 抓出。故拆成：
+              子进程 A：**只**调 locate_cells  -> 断言看不到提示
+              子进程 B：**只**裸跑 find_tables -> 断言**能看到**提示（对照）
+            两个进程各自独立，B 的对照才能证明"提示本来会出现"。
 
-            在 pytest 同进程里跑，前面的测试早已消费掉这唯一一次打印，
-            于是 ``capfd`` 捕获为空 —— **用例恒真（空转断言）**。
-            本用例最初正是这样写的，"去掉静音"的变异实验**没有失败**
-            才被抓出来（见 ``.verify/probe_p2/probe_p2_mutation.txt`` M3）。
-            且它写的是 **stdout**，不是 stderr（同见该文件）。
-
-            故这里开一个**全新子进程**，并在其中：
-              ① 裸跑一次 find_tables() -> 断言**能看到**提示（对照）
-              ② 走 locate_cells()      -> 断言**看不到**提示（被测行为）
-            两步在同一个子进程里，才能保证"提示本来会出现"这个前提成立。
+        🔴 为什么不用 ``capfd``：同进程内前面的测试早已消费掉那一次打印，
+        捕获恒为空，用例恒真。
         """
         import subprocess
         import sys
 
-        script = (
-            "import sys, fitz\n"
+        root = Path(__file__).resolve().parents[1]
+
+        def run_child(body: str) -> str:
+            script = "import sys, fitz\n" + body + "print('__DONE__')\n"
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=str(root), capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            )
+            out = proc.stdout + proc.stderr
+            assert "__DONE__" in out, f"子进程未跑完：{out!r}"
+            return out
+
+        # --- 子进程 A：走生产路径，应**看不到**提示 ---
+        body_a = (
             "sys.path.insert(0, 'src')\n"
             "from redactor.handlers.pdf_common import locate_cells\n"
             "doc = fitz.open()\n"
-            "p1 = doc.new_page()\n"
-            "p1.insert_text((60,70),'x',fontname='china-s')\n"
-            "p1.find_tables()\n"          # ① 裸跑，消费掉"只打印一次"的机会
-            "p2 = doc.new_page()\n"
-            "p2.insert_text((60,70),'y',fontname='china-s')\n"
-            "locate_cells(p2)\n"          # ② 走被测函数
+            "pg = doc.new_page()\n"
+            "pg.insert_text((60,70),'x',fontname='china-s')\n"
+            "locate_cells(pg)\n"
+            "doc.close()\n"
+        )
+        out_a = run_child(body_a)
+        assert "pymupdf_layout" not in out_a, (
+            f"静音未生效：走 locate_cells 后仍能看到提示 —— {out_a!r}"
+        )
+
+        # --- 子进程 B：裸跑对照，应**能看到**提示 ---
+        # 没有这条对照，A 的"看不到"可能是"提示根本不存在"造成的假象。
+        body_b = (
+            "doc = fitz.open()\n"
+            "pg = doc.new_page()\n"
+            "pg.insert_text((60,70),'x',fontname='china-s')\n"
+            "pg.find_tables()\n"
+            "doc.close()\n"
+        )
+        out_b = run_child(body_b)
+        assert "pymupdf_layout" in out_b, (
+            f"对照失败：裸跑 find_tables() 应能看到提示，否则本用例无意义 —— "
+            f"{out_b!r}"
+        )
+
+    def test_静音窗口内的缓冲内容不会泄漏(self):
+        """静音必须 flush，否则缓冲内容会在恢复 fd **之后**才落盘。
+
+        这是上一版静音无效的根因（实测见
+        ``.verify/probe_p2/silence/silence_rootcause.txt``）：
+        提示经 Python 的 ``sys.stdout`` 写出，先进缓冲区；``dup2``
+        只改 fd 指向、不 flush，于是缓冲区内容在恢复 fd 后才落盘。
+        """
+        import subprocess
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        script = (
+            "import sys, fitz\n"
+            "sys.path.insert(0, 'src')\n"
+            "from redactor.handlers.pdf_common import _silence_native_noise\n"
+            # 先往 sys.stdout 缓冲区里塞点东西（不 flush），
+            # 再进静音窗口 —— 模拟"窗口前已有未落盘输出"
+            "sys.stdout.write('BEFORE_SILENCE\\n')\n"
+            "with _silence_native_noise():\n"
+            "    sys.stdout.write('INSIDE_SILENCE\\n')\n"
+            "sys.stdout.write('AFTER_SILENCE\\n')\n"
             "print('__DONE__')\n"
         )
-        root = Path(__file__).resolve().parents[1]
         proc = subprocess.run(
-            [sys.executable, "-c", script],
-            cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+            [sys.executable, "-c", script], cwd=str(root),
+            capture_output=True, text=True, encoding="utf-8",
             errors="replace",
         )
-        combined = proc.stdout + proc.stderr
-        assert "__DONE__" in combined, f"子进程未跑完：{combined!r}"
-        assert "pymupdf_layout" in combined, (
-            "对照失败：裸跑 find_tables() 应能看到提示，否则本用例无意义"
+        out = proc.stdout + proc.stderr
+        assert "__DONE__" in out, f"子进程未跑完：{out!r}"
+        # 窗口前的输出必须保住（不能被静音"顺带"吞掉）
+        assert "BEFORE_SILENCE" in out, (
+            f"静音前的缓冲输出丢失（进入静音前应先 flush）—— {out!r}"
         )
-        # 提示只出现 1 次（来自裸跑那一次）；locate_cells 不应再产生
-        n = combined.count("pymupdf_layout")
-        assert n == 1, (
-            f"提示应只出现 1 次（裸跑那次），实际 {n} 次 —— "
-            f"说明 locate_cells 的静音未生效：{combined!r}"
+        # 窗口内的输出必须被吞掉
+        assert "INSIDE_SILENCE" not in out, (
+            f"静音窗口内的输出泄漏 —— {out!r}"
         )
+        # 窗口后的输出必须正常
+        assert "AFTER_SILENCE" in out, f"静音后输出未恢复 —— {out!r}"
 
     def test_静音后输出能恢复(self):
         """fd 级重定向必须恢复，否则会吞掉后续所有真实输出。"""
