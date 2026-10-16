@@ -45,23 +45,31 @@ P1.3 的 L3 验证原本是「在输出文件的**原始字节**里搜明文，�
 3. **排除字体程序流**（``/FontFile*``、``/Length1``）：字体子集里可能
    恰好含目标字节序列，那是误报源而非文本残留。排除后可能漏掉
    「文本被塞进字体程序」这种非常规情形。
-4. **不覆盖 /Info 元数据与 XObject 之外的对象**（**产品级缺口，尚未修**）：
+4. **不覆盖 /Info 元数据与 XObject 之外的对象**：
    本模块只搜**内容流**（``doc.xref_stream``），而 ``/Info`` 字典
    （Title / Author / Subject / Keywords / Creator / Producer）是
    **普通字符串对象，不是流**，因此完全不在此搜索域内。
 
-   实测复现（``.verify/probe_meta.py``）：造样本
+   实测复现（``.verify/probe_p3/probe_p3_meta.py``）：造样本
    ``set_metadata(title="报告 13800138000", author=..., subject=...,
-   keywords=..., creator=...)`` 走一遍脱敏后，
-   **5 个字段全部原样保留**手机号，``fitz`` 打开输出文件
-   ``metadata['title']`` 仍读出完整号码；而本模块对同一文件判 **PASS**。
+   keywords=..., creator=...)`` 走一遍脱敏后，本模块对同一文件判 **PASS**；
+   而 ``fitz`` 打开输出文件 ``metadata['title']`` 读出的是**占位符**
+   （P3 起由 ``redactor.handlers.pdf_metadata`` 负责清洗）。
+
+   更关键的反向证据：造一份**正文无手机号、只有元数据含手机号**的样本，
+   ``verify_residue(样本, 样本, [手机号])`` 得到
+   ``detectable_in_source=False`` —— L3 连"源文件里有这个串"都看不见。
+   这才证明它的搜索域**完全不含元数据**（``ok=False`` 那种情况是空转，
+   语义不同，不能当证据）。
 
    即：**L3 PASS 不代表整份文件无残留**，只代表「内容流里没有」。
    同理，XObject（表单/嵌入对象）之外的非常规容器也未覆盖。
-   该缺口自 P1.1 起就存在，与 L3 差分改造无关，**列入后续轮次**。
+   该缺口自 P1.1 起就存在，与 L3 差分改造无关。
 
    使用本模块时务必同时跑 L1/L2，并对元数据单独检查——
    不要把它当作"整份文件已删净"的唯一证据。
+   元数据的**清洗**归 ``pdf_metadata``，元数据的**验证**归
+   ``fitz.metadata`` / ``get_xml_metadata()``，两边都不在本模块。
 """
 
 from __future__ import annotations

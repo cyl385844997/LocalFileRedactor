@@ -6,7 +6,10 @@
     P0  txt_handler   纯文本
     P1  docx_handler  Word 正文段落（含跨 run 匹配）
     P2  xlsx_handler  待实现
-    P3  pdf_handler   文本层 PDF（扫描件明确报错，不做 OCR）
+    PDF-P1  pdf_handler   文本层 PDF 真 redaction（扫描件明确报错，不做 OCR）
+    PDF-P2  pdf_common    表格识别分级（有框线给行列号，无框线只给页码 + 坐标）
+    PDF-P3  pdf_metadata  元数据清洗（``/Info`` 六字段 + XMP）
+    PDF-P3  pdf_verify    字节级差分验证（**不覆盖元数据**，见其 docstring）
 """
 
 from __future__ import annotations

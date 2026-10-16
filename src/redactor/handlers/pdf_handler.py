@@ -31,6 +31,9 @@
     P2   表格识别分级：有框线给行列号，无框线只给页码 + 坐标
          （**不给无框线表格的行列号** —— 实测无法可靠判断，详见
          :func:`~redactor.handlers.pdf_common.locate_cells` 的说明）
+    P3   元数据清洗：``/Info`` 六字段 + XMP（详见
+         :mod:`redactor.handlers.pdf_metadata`）。
+         位置标签 ``元数据 /Title`` / ``元数据 XMP``，``page_index = -1``。
 """
 
 from __future__ import annotations
@@ -56,6 +59,7 @@ from redactor.handlers.pdf_common import (
     rects_for_hits,
     write_placeholder,
 )
+from redactor.handlers.pdf_metadata import scrub_metadata
 
 #: 无文本层时给用户的原因码（复用基类的 CORRUPTED 不合适，单独一个更明确）
 NO_TEXT_LAYER = "pdf_no_text_layer"
@@ -131,7 +135,31 @@ class PdfHandler(BaseHandler):
             all_hits, stats, locations, diagnostics = self._scan(
                 doc, engine, source
             )
+
+            # --- P3：元数据清洗（/Info + XMP）---
+            # 放在 _scan 之外，是为了**不破坏 _scan 的只读契约**
+            # （_scan 语义是"扫描"，元数据清洗是"写入"）。
+            # dry_run 时也会执行，但不会 save，故源文件不受影响，
+            # 且 dry-run 报告能准确反映元数据里的命中数。
+            meta = scrub_metadata(doc, engine)
+            if meta.matches:
+                flat = [h.match for h in all_hits]
+                flat.extend(meta.matches)
+                for seq, (m, label) in enumerate(
+                    zip(meta.matches, meta.labels), start=1
+                ):
+                    locations[location_key(m)] = f"{label} 第 {seq} 处"
+                # 重新聚合：stats 必须含元数据命中，否则报告少报
+                stats = RedactionEngine.aggregate(
+                    flat, locations, key_of=location_key
+                )
+                diagnostics["meta_hits"] = len(meta.matches)
+                diagnostics["meta_fields"] = meta.fields_touched
+            diagnostics["meta_warnings"] = meta.warnings
+            diagnostics["meta_touched"] = meta.fields_touched
+
             loc_note = self.describe_location_mode(diagnostics)
+            warn_note = self.describe_metadata_warnings(diagnostics)
 
             if dry_run:
                 return FileResult(
@@ -140,8 +168,8 @@ class PdfHandler(BaseHandler):
                     status="ok",
                     hits=stats,
                     message=(
-                        f"发现 {len(all_hits)} 处命中（dry-run，未写文件）"
-                        f"{loc_note}"
+                        f"发现 {len(all_hits) + len(meta.matches)} 处命中"
+                        f"（dry-run，未写文件）{loc_note}{warn_note}"
                     ),
                 )
 
@@ -164,7 +192,10 @@ class PdfHandler(BaseHandler):
                 output=str(output),
                 status="ok",
                 hits=stats,
-                message=f"已处理 {len(all_hits)} 处命中{note}{loc_note}",
+                message=(
+                    f"已处理 {len(all_hits) + len(meta.matches)} 处命中"
+                    f"{note}{loc_note}{warn_note}"
+                ),
             )
         finally:
             doc.close()
@@ -395,6 +426,7 @@ class PdfHandler(BaseHandler):
         cell_hits = int(diagnostics.get("cell_hits", 0) or 0)
         coord_hits = int(diagnostics.get("coord_hits", 0) or 0)
         table_pages = list(diagnostics.get("table_pages", []) or [])
+        meta_hits = int(diagnostics.get("meta_hits", 0) or 0)
 
         parts: List[str] = []
         if cell_hits:
@@ -408,9 +440,38 @@ class PdfHandler(BaseHandler):
                 f"{coord_hits} 处仅给页码与坐标"
                 f"（无框线表格不推断行列号，避免给出错误位置）"
             )
+        if meta_hits:
+            # 元数据不属于任何页，位置标签是 `元数据 /Title` 这种形式。
+            # 报告必须说明，否则用户看到"元数据 /Title"会以为工具出了错。
+            fields = list(diagnostics.get("meta_fields", []) or [])
+            shown = "、".join(fields[:5])
+            more = f" 等 {len(fields)} 个字段" if len(fields) > 5 else ""
+            parts.append(
+                f"{meta_hits} 处在文档元数据里（{shown}{more}）"
+            )
         if not parts:
             return ""
         return "；定位：" + "，".join(parts)
+
+    @staticmethod
+    def describe_metadata_warnings(diagnostics: Dict[str, object]) -> str:
+        """把元数据告警翻译成报告里的一句话。
+
+        两类告警（都是"必须让用户知道"的）：
+
+        1. **跨节点敏感串**：XMP 里敏感串被 XML 标签拆开，任何单节点
+           视角都识别不出，本工具无法自动清洗。**绝不静默漏掉**。
+        2. **XML 回退**：清洗后 XML 非法，已退回原文（该处未清洗）。
+
+        为什么告警要进 ``message`` 而不只是日志：
+            用户拿到的是一份"看起来已脱敏"的文件。若元数据里其实还有
+            残留而报告不提，用户不会去核对 —— 这正是本项目最忌讳的
+            "给了看似安全的假象"。
+        """
+        warnings = list(diagnostics.get("meta_warnings", []) or [])
+        if not warnings:
+            return ""
+        return "；⚠️ " + "；⚠️ ".join(str(w) for w in warnings)
 
 
 __all__ = ["PdfHandler", "NO_TEXT_LAYER"]

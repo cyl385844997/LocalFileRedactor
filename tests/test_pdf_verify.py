@@ -335,26 +335,28 @@ class TestResidueCheck:
         assert EMAIL not in report
 
 
-# ============================================================== 已知缺口
-class TestKnownGapInfoMetadata:
-    """**已知产品级缺口**：L3 不覆盖 ``/Info`` 元数据。
+# ============================================================== 元数据缺口（已修）
+class TestInfoMetadataScrubbed:
+    """**元数据缺口已在 P3 修复**（原 ``TestKnownGapInfoMetadata``）。
 
-    本组用例把缺口**固化成可执行的记录**，而不是只写在注释里：
+    历史
+    ----
+    本组用例原先用 ``xfail(strict=True)`` 标注"``/Info`` 元数据未清洗"这个
+    产品级缺口。P3 实现元数据清洗后，``xfail`` 变成 ``XPASS``，
+    ``strict=True`` 立即报错，**强制**把断言与文档一起改掉 ——
+    这个机制按设计生效了（见 commit 历史）。
 
-    - 用 ``xfail(strict=True)`` 标注。一旦后续轮次修好元数据清洗，
-      这些用例会变成 ``XPASS``，``strict=True`` 会让它**报错**——
-      从而强制把这里的断言和文档一起改掉，不会留下过期说明。
+    现在的语义**反过来了**：元数据**必须**被清洗。若哪天又残留，
+    说明清洗逻辑被破坏，本组用例会失败。
 
-    缺口来源：``pdf_verify`` 只搜内容流（``doc.xref_stream``），
-    而 ``/Info`` 是**普通字符串对象、不是流**，完全不在搜索域内。
+    注意 L3（``verify_residue``）**仍然**不覆盖 ``/Info``：
+    它只搜内容流（``doc.xref_stream``），而 ``/Info`` 是普通字符串对象。
+    故下面仍有一条用例**记录这个盲区**，提醒使用者：
+    **L3 PASS ≠ 整份文件无残留**，元数据要单独验证。
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="已知缺口：PDF /Info 元数据未清洗（自 P1.1 起，列入后续轮次）",
-    )
-    def test_元数据里的手机号应被清洗_当前未实现(self, tmp_path):
-        """脱敏后元数据不应再含敏感串。当前会失败——这就是缺口本身。"""
+    def test_元数据里的手机号已被清洗(self, tmp_path):
+        """脱敏后元数据不应再含敏感串（P3 已实现）。"""
         doc = fitz.open()
         page = doc.new_page(width=595, height=842)
         page.insert_text((60, 130), f"电话 {PHONE}", fontsize=12,
@@ -376,14 +378,19 @@ class TestKnownGapInfoMetadata:
         after = fitz.open(str(out)).metadata
         leaked = {k: v for k, v in after.items() if v and PHONE in v}
         assert not leaked, (
-            f"元数据仍含手机号：{leaked} —— 这正是待修的缺口"
+            f"元数据仍含手机号：{leaked} —— P3 清洗应已覆盖这 5 个字段"
         )
 
-    def test_L3对元数据缺口判PASS_把盲区记录在案(self, tmp_path):
-        """**这条必须 PASS**：它记录"L3 会漏判元数据"这一事实。
+    def test_L3仍不覆盖元数据_盲区记录在案(self, tmp_path):
+        """**这条必须 PASS**：它记录"L3 会漏判元数据"这一**仍然存在**的事实。
 
-        若哪天它失败了，说明 L3 的搜索域已经覆盖到元数据——
-        那时上面的 xfail 应随之转为正式断言，本文档也要改。
+        P3 修的是**清洗**，不是 L3 的搜索域。``verify_residue`` 依然只搜
+        内容流，故对"元数据已被清洗"的文件它照样判 PASS —— 此时 PASS 是
+        **正确**的（确实无残留），但它**不能**用来证明"元数据已清洗"，
+        因为若清洗失效它也会 PASS。
+
+        换句话说：**L3 PASS 对元数据不构成证据**（恒真）。
+        元数据必须用 `fitz.metadata` / `get_xml_metadata()` 单独验证。
         """
         doc = fitz.open()
         page = doc.new_page(width=595, height=842)
@@ -398,14 +405,45 @@ class TestKnownGapInfoMetadata:
         PdfHandler().process(src, out, engine())
 
         check = verify_residue(src, out, [PHONE])[0]
+        # P3 后元数据里的手机号已被清掉 —— 这是**产品行为**，不是 L3 的功劳
         still_in_meta = PHONE in fitz.open(str(out)).metadata.get("title", "")
-        assert still_in_meta, (
-            "元数据里的手机号竟然没了？缺口可能已被修，"
-            "请把 xfail 用例转正并更新文档"
-        )
+        assert not still_in_meta, "P3 应已清洗 /Title"
+        # L3 判 PASS：它本来就没看元数据，此处 PASS 与元数据清洗无关
         assert check.ok, (
-            "L3 对含元数据残留的文件判 PASS —— 这是已知盲区，"
+            "L3 对含元数据的文件判 PASS —— 这是已知盲区，"
             "记录在案以免被误当作'整份文件已删净'"
+        )
+        # ---- 反向对照（这一条才是"L3 看不见元数据"的证据）----
+        #
+        # 上面 `check.ok` 为 True 其实**两种原因都可能**：
+        #   (a) 元数据被清洗了 + L3 本来就不看元数据；
+        #   (b) L3 确实在看元数据，而且看到它被清洗了。
+        # 只看 `check.ok` 无法区分，所以它不是证据。
+        #
+        # 正确对照：造一份**正文完全没有手机号、只有元数据里有**的样本。
+        # 若 L3 的搜索域真的包含元数据，它就该在源文件上检出该串
+        # （`detectable_in_source=True`）；实测为 False ——
+        # 连"源文件里有这个串"都看不见，才证明**搜索域不含元数据**。
+        #
+        # 注意这里断言的是 `detectable_in_source`（鉴别力），
+        # **不是** `ok`：`ok` 在"源也检不出"时同样为 False，
+        # 但那是空转（搜索域选错），语义完全不同 ——
+        # 早期版本正是把两者混为一谈，写出了无效对照。
+        doc2 = fitz.open()
+        doc2.new_page(width=595, height=842)  # 正文一个字都不写
+        doc2.set_metadata({"title": f"报告 {PHONE}"})
+        meta_only = tmp_path / "meta_only.pdf"
+        doc2.save(str(meta_only))
+        doc2.close()
+
+        blind = verify_residue(meta_only, meta_only, [PHONE])[0]
+        assert not blind.detectable_in_source, (
+            "L3 竟能在源文件里检出只存在于元数据的串 —— "
+            "说明它的搜索域已包含元数据，本用例记录的前提失效，请重写"
+        )
+        assert not blind.ok, "源检不出 → ok 必为 False（空转）"
+        assert "[无鉴别力]" in blind.describe(), (
+            f"describe 应显式标注无鉴别力，实际：{blind.describe()!r}"
         )
 
     def test_缺口已写进模块文档(self):
