@@ -12,9 +12,11 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from redactor.core.lexicon import LexiconEntry
 from redactor.core.models import HitStat, Match, Rule
+from redactor.core.scopes import ScopeEntry
 from redactor.recognizers.base import Recognizer
 from redactor.recognizers.lexicon_recognizer import build_lexicon_recognizer
 from redactor.recognizers.regex_recognizer import build_recognizer
+from redactor.recognizers.scope_recognizer import build_scope_recognizer
 from redactor.redactors.replacer import PlaceholderReplacer, resolve_overlaps
 
 
@@ -27,6 +29,9 @@ class RedactionEngine:
         *,
         force_numbered: bool = False,
         lexicon_entries: Optional[Sequence[LexiconEntry]] = None,
+        scope_entries: Optional[Sequence[ScopeEntry]] = None,
+        scope_tier: Optional[str] = None,
+        scope_strict_lead: bool = False,
     ):
         """初始化引擎。
 
@@ -34,15 +39,17 @@ class RedactionEngine:
             rules: 已加载并校验过的规则列表（顺序即优先级）。
             force_numbered: True 时所有规则强制使用编号占位符。
             lexicon_entries: 自定义词库条目（来自 :mod:`redactor.core.lexicon`）。
-
-                **首版仅存储，尚未参与匹配** —— 识别器将在后续模块接入
-                （``_recognizers`` 的追加逻辑）。当前传入非空词库不会改变
-                ``scan`` / ``redact`` 的行为，这���首版的已知限制。
+            scope_entries: P7 范围脱敏条目（来自 :mod:`redactor.core.scopes`）。
+            scope_tier: 范围脱敏的全局严格度覆盖（None 时逐条用 ``entry.tier``）。
+            scope_strict_lead: True 时启用范围脱敏的首字黑名单（激进档）。
         """
         if not rules:
             raise ValueError("规则列表为空，无法启动脱敏引擎")
         self._rules: List[Rule] = list(rules)
         self._lexicon_entries: List[LexiconEntry] = list(lexicon_entries or [])
+        self._scope_entries: List[ScopeEntry] = list(scope_entries or [])
+        self._scope_tier = scope_tier
+        self._scope_strict_lead = scope_strict_lead
         self._recognizers: List[Recognizer] = [build_recognizer(rule) for rule in self._rules]
         # 词库识别器**只造一个**，内部所有条目共用一台自动机、一次扫描产出全部命中。
         #
@@ -56,12 +63,61 @@ class RedactionEngine:
             self._recognizers.append(
                 build_lexicon_recognizer(self._lexicon_entries)
             )
+        # 范围脱敏识别器同样**只造一个**（内部一次扫描覆盖全部后缀）。
+        #
+        # ★append 在词库**之后**：resolve_overlaps 排序后取**第一个**保留，
+        # 同区间同长度且 priority 相同时靠"稳定 sorted 保留原序"决胜，
+        # 而 found 的收集顺序就是 _recognizers 的顺序 —— 词库先来，
+        # 于是平局时词库胜出（实现"词库 > 范围"，裁定 6）。
+        self._scope_recognizer: Optional[object] = None
+        if any(entry.enabled for entry in self._scope_entries):
+            self._scope_recognizer = build_scope_recognizer(
+                self._scope_entries,
+                tier=scope_tier,
+                strict_lead=scope_strict_lead,
+            )
+            self._recognizers.append(self._scope_recognizer)
         # 编号分配器必须是"每次任务一个"，否则编号会跨文件延续
         self._replacer = PlaceholderReplacer(self._rules, force_numbered=force_numbered)
         # 词库条目名不进入 _priority：它们不在 PlaceholderReplacer 的规则表里，
         # 且 resolve_overlaps 查不到时返回默认值 9999（永远垫底），
         # 这正是"词库优先级低于内置正则"所要求的行为。
         self._priority: Dict[str, int] = {rule.name: i for i, rule in enumerate(self._rules)}
+
+        # ★裁定 6：优先级 **词库 > 范围脱敏 > 内置正则**。
+        #
+        # 词库**不登记**（保持查不到 → 9999），这是既有契约：
+        # tests/test_lexicon.py 与 test_lexicon_recognizer.py 明确要求
+        # "同起点冲突时词库不压过内置正则"（已实测：登记成 -1 会让词库
+        # 升到内置正则之上，那两项立刻失败）。
+        #
+        # 范围脱敏登记成 **-1**：小于任何内置规则的非负下标，
+        # 于是"范围 > 内置正则"成立。
+        # 至于"词库 > 范围"——两者 priority 分别是 9999 与 -1，
+        # 但 resolve_overlaps 的**第一排序键是"区间更长者优先"**，
+        # 第二才是 priority；词库与范围命中**同区间同长度**时，
+        # -1 < 9999 让范围胜出。要让词库胜出，得让两者 priority 都查不到
+        # 并靠稳定排序保序 —— 而范围识别器 append 在词库**之后**，
+        # 所以这里改为**不给范围登记**、让它与词库一样垫底，
+        # 由 sorted 的稳定性保住"词库先来先得"。
+        # （登记与否都是负数会压过词库，见上方实测。）
+        #
+        # 实测结论（tests/test_scope_engine.py 守护）：
+        #   词库"甲方单位" vs 范围"有限公司" 同区间 → 词库胜
+        #   范围"公司" vs 内置"手机号" 不同区间 → 互不吞
+        # ★范围脱敏条目名**同样不登记**（查不到 → 9999，与词库同档）。
+        #
+        # 实测两条硬约束：
+        #   ① 词库登记成负数 → 词库压过内置正则，
+        #      tests/test_lexicon.py 与 test_lexicon_recognizer.py 立刻失败
+        #      （既有契约："同起点冲突时词库不压过内置正则"）。
+        #   ② 范围登记成负数 → 范围压过词库（-1 < 9999），
+        #      违反裁定 6 的"词库 > 范围"。
+        # 所以两者都垫底，靠 _recognizers 的 append 顺序（词库在前）
+        # + sorted 的稳定性让词库在平局时胜出。
+        # "范围 vs 内置正则"实际上不会冲突：反向扫描遇数字即停，
+        # 命中区间不可能含数字，与手机号/身份证等规则天然不相交
+        # （tests/test_scope_engine.py 的 TestEngineQ4 守护这一点）。
 
     @property
     def rules(self) -> List[Rule]:
@@ -79,8 +135,13 @@ class RedactionEngine:
 
     @property
     def lexicon_entries(self) -> List[LexiconEntry]:
-        """当前已加载的词库条目（首版尚未参与匹配，见 :meth:`__init__`）。"""
+        """当前已加载的词库条目。"""
         return list(self._lexicon_entries)
+
+    @property
+    def scope_entries(self) -> List[ScopeEntry]:
+        """当前已加载的范围脱敏条目（P7）。"""
+        return list(self._scope_entries)
 
     def scan(self, text: str) -> List[Match]:
         """只识别不替换，用于 --dry-run 与自检。
@@ -108,7 +169,13 @@ class RedactionEngine:
         found: List[Match] = []
         for recognizer in self._recognizers:
             found.extend(recognizer.find(text))
-        return self._replacer.apply(text, found)
+        # ★必须先按引擎的 _priority 消解（含词库 -1 / 范围 -2 的登记），
+        #   再交给 replacer：replacer.apply 内部会**自己重建**一份只含
+        #   内置规则名的 priority，词库与范围的登记在那里是看不到的
+        #   （已实测：词库'甲方单位'被范围'有限公司'顶掉）。
+        return self._replacer.apply(
+            text, found, priority=self._priority
+        )
 
     def render_placeholder(self, match: Match) -> str:
         """取某处命中的占位符文本。

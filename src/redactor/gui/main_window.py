@@ -41,12 +41,19 @@ from typing import List, Optional, Sequence
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from redactor.core.models import FileResult
+from redactor.core.scopes import (
+    DEFAULT_TIER,
+    HIGH_SUFFIXES,
+    LOW_SUFFIXES,
+    ScopeEntry,
+)
 from redactor.gui.controller import RedactorController
 from redactor.gui.widgets import (
     DropZoneList,
     LogPanel,
     PreviewPanel,
     StatusProgressBar,
+    normalize_path,
 )
 
 
@@ -108,6 +115,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_ok = 0
         self._stats_failed = 0
         self._stats_hits = 0
+        # P7：范围脱敏条目（由设置对话框写入；为空 = 未启用）
+        self._scope_entries: List[ScopeEntry] = []
 
         # ---- 信号接通 ----
         self._drop_zone.files_added.connect(self._on_files_added)
@@ -205,6 +214,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self._act_open_out_dir.setEnabled(False)
         self._act_open_out_dir.triggered.connect(self._on_open_out_dir_clicked)
         tb.addAction(self._act_open_out_dir)
+
+        tb.addSeparator()
+
+        # P7：范围脱敏设置（独立对话框，裁定 3）
+        self._act_scopes = QtGui.QAction("范围脱敏", self)
+        self._act_scopes.setToolTip(
+            "范围脱敏设置：输入后缀自动匹配带该后缀的整个实体（v0.7.0）"
+        )
+        self._act_scopes.setCheckable(True)
+        self._act_scopes.setChecked(False)
+        self._act_scopes.triggered.connect(self._on_scopes_clicked)
+        tb.addAction(self._act_scopes)
+
+    # ---------------------------------------------------------- P7 范围脱敏
+    def _on_scopes_clicked(self) -> None:
+        """打开范围脱敏设置对话框（裁定 3：独立对话框，不与词库混）。"""
+        from redactor.gui.dialogs.scope_dialog import ScopeDialog
+
+        dlg = ScopeDialog(self)
+        if self._scope_entries:
+            dlg.set_suffixes(
+                sorted({s for e in self._scope_entries for s in e.suffixes})
+            )
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        entries = dlg.entries()
+        if not entries or not entries[0].suffixes:
+            # 用户没填后缀 = 关闭范围脱敏
+            self._scope_entries = []
+            self._act_scopes.setChecked(False)
+            self._log.append_line("范围脱敏：未配置任何后缀，已关闭")
+            self._apply_scope_to_controller()
+            return
+
+        self._scope_entries = entries
+        self._act_scopes.setChecked(True)
+        self._apply_scope_to_controller()
+        self._log.append_line(
+            f"范围脱敏已启用：{len(entries[0].suffixes)} 个后缀"
+            f"（严格度={dlg.current_tier()}"
+            f"{'，首字黑名单开' if dlg.strict_lead_enabled() else ''}）"
+        )
+
+    def _apply_scope_to_controller(self) -> None:
+        """把当前范围配置写进 Controller（下一次 start 时生效）。"""
+        tier = None
+        strict = False
+        for e in self._scope_entries:
+            tier = e.tier
+            strict = e.strict_lead
+        self._controller.set_scope(
+            self._scope_entries, tier=tier, strict_lead=strict
+        )
 
     def _build_statusbar(self) -> None:
         sb = self.statusBar()
@@ -612,6 +675,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def last_output_root(self) -> Optional[Path]:
         """公开：最近一次的输出根目录；未处理过则 None。"""
         return self._last_output_root
+
+    def scope_entries(self) -> List[ScopeEntry]:
+        """公开：当前范围脱敏条目（P7；空列表 = 未启用）。"""
+        return list(self._scope_entries)
+
+    def scopes_action(self) -> QtGui.QAction:
+        """公开：工具栏"范围脱敏"按钮（P7）。"""
+        return self._act_scopes
+
+    def apply_scope_entries(
+        self, entries: Sequence[ScopeEntry], *, enable: bool = True
+    ) -> None:
+        """公开（测试 / 自动化）：直接设置范围脱敏条目，跳过对话框。
+
+        与真实用户操作走同一条应用路径（:meth:`_apply_scope_to_controller`）。
+        """
+        self._scope_entries = list(entries) if enable else []
+        self._act_scopes.setChecked(bool(self._scope_entries))
+        self._apply_scope_to_controller()
 
     def state(self) -> str:
         """公开：当前按钮状态机（供测试断言）。"""

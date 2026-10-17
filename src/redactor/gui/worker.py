@@ -34,6 +34,7 @@ from redactor.core.engine import RedactionEngine
 from redactor.core.lexicon import default_lexicon_path, load_lexicon
 from redactor.core.models import FileResult
 from redactor.core.rules import load_rule_dir, load_rules
+from redactor.core.scopes import ScopeEntry
 from redactor.cli import _default_rules_dir  # noqa: F401  —— 复用 CLI 的"内置规则目录定位"
 from redactor.handlers import get_handler
 from redactor.handlers.base import HandlerError
@@ -45,12 +46,23 @@ def build_engine_for_gui(
     rules_dir: Optional[Path] = None,
     force_numbered: bool = False,
     use_lexicon: bool = True,
+    scope_entries: Optional[Sequence[ScopeEntry]] = None,
+    scope_tier: Optional[str] = None,
+    scope_strict_lead: bool = False,
 ) -> RedactionEngine:
     """为 GUI 构造 RedactionEngine（无 argparse.Namespace 依赖）。
 
     与 :func:`redactor.cli._build_engine` 同源；GUI 层不构造 Namespace，
     直接传 keyword args。规则目录定位复用 ``_default_rules_dir``（含
     REDACTOR_RULES_DIR 环境变量回退）。
+
+    Args:
+        rules_dir: 规则目录；None 时用内置 ``rules/``。
+        force_numbered: 强制编号占位符。
+        use_lexicon: 是否加载默认词库。
+        scope_entries: P7 范围脱敏条目（空列表 = 不启用）。
+        scope_tier: 范围脱敏严格度覆盖。
+        scope_strict_lead: 范围脱敏首字黑名单。
     """
     rules_root = rules_dir if rules_dir is not None else _default_rules_dir()
     if rules_root.is_dir():
@@ -70,6 +82,9 @@ def build_engine_for_gui(
         rules,
         force_numbered=force_numbered,
         lexicon_entries=lexicon_entries,
+        scope_entries=scope_entries,
+        scope_tier=scope_tier,
+        scope_strict_lead=scope_strict_lead,
     )
 
 

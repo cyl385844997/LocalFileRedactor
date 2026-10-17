@@ -21,6 +21,7 @@ from typing import List, Optional, Sequence
 from PySide6 import QtCore
 
 from redactor.core.engine import RedactionEngine
+from redactor.core.scopes import ScopeEntry
 
 from redactor.gui.worker import RedactionWorker, build_engine_for_gui
 
@@ -54,6 +55,37 @@ class RedactorController(QtCore.QObject):
         self._rules_dir = rules_dir
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[RedactionWorker] = None
+        # P7 范围脱敏配置（由 GUI 设置对话框写入，start 时传给 engine）
+        self._scope_entries: List[ScopeEntry] = []
+        self._scope_tier: Optional[str] = None
+        self._scope_strict_lead = False
+
+    # ----------------------------------------------------- P7 范围脱敏
+    def set_scope(
+        self,
+        entries: Sequence[ScopeEntry],
+        *,
+        tier: Optional[str] = None,
+        strict_lead: bool = False,
+    ) -> None:
+        """设置范围脱敏配置（P7）。
+
+        每次 :meth:`start` 都新建 engine，故这里只需**记住配置**，
+        不必立即重建识别器。传空列表表示关闭范围脱敏。
+
+        注意：**运行中不允许改** —— 已启动的 worker 用的是旧 engine，
+        改了也要等下次 start 才生效，与用户直觉不符。运行中调用直接忽略
+        并保持原配置。
+        """
+        if self.is_running():
+            return
+        self._scope_entries = list(entries or [])
+        self._scope_tier = tier
+        self._scope_strict_lead = strict_lead
+
+    def scope_entries(self) -> List[ScopeEntry]:
+        """当前范围脱敏配置（只读副本）。"""
+        return list(self._scope_entries)
 
     # ----------------------------------------------------- 状态查询
     def is_running(self) -> bool:
@@ -82,7 +114,12 @@ class RedactorController(QtCore.QObject):
             raise RuntimeError("已有任务在跑；请先 cancel 或等 finished")
 
         # 1. 新建 engine（每个任务独立；engine 无状态但保证隔离）
-        engine = build_engine_for_gui(rules_dir=self._rules_dir)
+        engine = build_engine_for_gui(
+            rules_dir=self._rules_dir,
+            scope_entries=self._scope_entries,
+            scope_tier=self._scope_tier,
+            scope_strict_lead=self._scope_strict_lead,
+        )
 
         # 2. 新建 Worker + Thread
         self._thread = QtCore.QThread()

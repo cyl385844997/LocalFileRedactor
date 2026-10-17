@@ -22,6 +22,13 @@ from redactor.core.engine import RedactionEngine
 from redactor.core.lexicon import LexiconEntry, default_lexicon_path, load_lexicon
 from redactor.core.models import FileResult, Rule, RuleError
 from redactor.core.rules import load_rule_dir, load_rules
+from redactor.core.scopes import (
+    DEFAULT_TIER,
+    TIERS,
+    ScopeEntry,
+    default_scopes_path,
+    load_scopes,
+)
 from redactor.handlers import get_handler, supported_extensions
 from redactor.handlers.base import HandlerError
 from redactor.report import REASON_LABELS, Report
@@ -131,12 +138,54 @@ def _build_engine(args: argparse.Namespace) -> RedactionEngine:
         raise RuleError("没有生效的规则，拒绝执行（宁可不脱敏，也不能静默放行）")
 
     lexicon_entries = _load_lexicon_if_requested(args, rules)
+    scope_entries = _load_scopes_if_requested(args, rules)
 
     return RedactionEngine(
         rules,
         force_numbered=args.numbered,
         lexicon_entries=lexicon_entries,
+        scope_entries=scope_entries,
+        scope_tier=getattr(args, "scope_tier", None),
+        scope_strict_lead=getattr(args, "scope_strict_lead", False),
     )
+
+
+def _load_scopes_if_requested(
+    args: argparse.Namespace,
+    rules: List[Rule],
+) -> Optional[List[ScopeEntry]]:
+    """按 CLI 参数决定是否加载 P7 范围脱敏配置，返回条目列表。
+
+    加载顺序（优先级由高到低）：
+      1. 显式 ``--scopes <路径>`` -> 必须存在，找不到直接报错
+      2. ``--no-scopes`` -> 明确禁用，连默认配置也不看
+      3. 默认 ``~/.redactor/scopes.yaml`` -> 不存在属正常，静默跳过
+
+    Args:
+        args: 已解析的命令行参数。
+        rules: 已加载的正则规则，用于给范围条目名做冲突检查。
+
+    Returns:
+        范围条目列表；未启用时返回空列表（引擎会跳过造识别器）。
+
+    Raises:
+        RuleError: 显式指定的文件不存在、加载或校验失败。
+    """
+    explicit = getattr(args, "scopes", None)
+    no_scopes = getattr(args, "no_scopes", False)
+
+    if explicit:
+        # 显式指定却找不到 => 报错。静默放行等于脱敏失效，
+        # 而用户会以为已经脱敏。
+        return load_scopes(explicit, reserved_names=[r.name for r in rules])
+
+    if no_scopes:
+        return []
+
+    default_path = default_scopes_path()
+    if default_path is None:
+        return []
+    return load_scopes(default_path, reserved_names=[r.name for r in rules])
 
 
 def _load_lexicon_if_requested(
@@ -345,6 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="忽略默认词库 ~/.redactor/lexicon.yaml（即使它存在也不加载）",
         )
+        _add_scope_args(sub)
         sub.add_argument("--only", nargs="+", help="只启用指定名称的规则")
         sub.add_argument("--numbered", action="store_true", help="强制使用编号占位符（如 [手机号#1]，会暴露同一性，默认关闭）")
         sub.add_argument("-r", "--recursive", action="store_true", help="递归处理子目录")
@@ -371,9 +421,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="忽略默认词库 ~/.redactor/lexicon.yaml",
     )
+    _add_scope_args(rules_parser)
     rules_parser.set_defaults(func=_cmd_rules)
 
     return parser
+
+
+def _add_scope_args(parser: argparse.ArgumentParser) -> None:
+    """给子命令加上 P7 范围脱敏的三个参数。
+
+    单列函数是因为 ``run`` / ``dry-run`` / ``rules`` 三处都要同样的参数，
+    复制三遍必然漂移。
+    """
+    parser.add_argument(
+        "--scopes",
+        help=(
+            "范围脱敏配置文件（默认 ~/.redactor/scopes.yaml，不存在则不启用）。"
+            "显式指定而文件不存在会直接报错，不静默放行"
+        ),
+    )
+    parser.add_argument(
+        "--no-scopes",
+        action="store_true",
+        help="忽略默认范围脱敏配置 ~/.redactor/scopes.yaml（即使它存在也不加载）",
+    )
+    parser.add_argument(
+        "--scope-tier",
+        choices=list(TIERS),
+        default=None,
+        help=(
+            f"范围脱敏严格度（默认 {DEFAULT_TIER}；"
+            "conservative=仅法律/机构后缀零误伤，balanced=+日常后缀，"
+            "aggressive=+首字黑名单）"
+        ),
+    )
+    parser.add_argument(
+        "--scope-strict-lead",
+        action="store_true",
+        help="启用范围脱敏的首字黑名单（这那每某该此各本作实体名首字时判为误伤）",
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

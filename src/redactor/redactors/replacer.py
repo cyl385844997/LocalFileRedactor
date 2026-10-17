@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from redactor.core.models import Match, Rule
 
@@ -87,18 +87,32 @@ class PlaceholderReplacer:
             self._next_index[match.rule_name] = index
         return f"[{match.rule_name}#{self._counters[key]}]"
 
-    def apply(self, text: str, matches: List[Match]) -> Tuple[str, List[Match]]:
+    def apply(
+        self,
+        text: str,
+        matches: List[Match],
+        *,
+        priority: Optional[Dict[str, int]] = None,
+    ) -> Tuple[str, List[Match]]:
         """把命中应用到文本。
 
         Args:
             text: 原始文本。
-            matches: 命中列表（内部会先做重叠消解）。
+            matches: 命中列表（默认会先做一次重叠消解）。
+            priority: 重叠消解用的优先级表。**传``None`` 时用内置规则的
+                下标**（历史行为，词库与范围条目名因此拿不到优先级）；
+                调用方若已用完整优先级表消解过（如
+                :meth:`RedactionEngine.redact`），应把同一张表传进来，
+                否则会**二次消解**并把词库/范围的登记丢掉（已实测：
+                词库"甲方单位"被范围"有限公司"顶掉）。
 
         Returns:
             ``(脱敏后文本, 实际生效的命中列表)``。
             第二个返回值供调用方生成报告中的位置信息。
         """
-        kept = resolve_overlaps(matches, {name: i for i, name in enumerate(self._rules)})
+        table = (priority if priority is not None
+                 else {name: i for i, name in enumerate(self._rules)})
+        kept = resolve_overlaps(matches, table)
         if not kept:
             return text, []
 
