@@ -26,13 +26,18 @@ temp/
 # pytest 缓存与临时目录（basetemp 已在 pyproject.toml 固定为 pytest_tmp/）
 # pytest 缓存与临时目录
 # pytest_tmp/ 是 scripts/test.bat 传入 --basetemp 的目标目录
+# pytest_tmp_marvis/ 是独立 agent（Marvis）跑测试的隔离目录
 .pytest_cache/
 .pytest_tmp/
 pytest_tmp/
+pytest_tmp_marvis/
 # 历史用法：曾用 .pt_* 作为 --basetemp 目录名
 .pt_*/
 .coverage
 htmlcov/
+
+# 隔离 pip 安装目录（探针用：pip install --target=.verify_libs <pkg>）
+.verify_libs/
 
 # 编辑器
 .idea/

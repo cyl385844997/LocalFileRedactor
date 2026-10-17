@@ -3,13 +3,15 @@
 一个**完全离线**的文件脱敏工具：把文档中的手机号、身份证号、银行卡号、邮箱、IP 等敏感信息，
 **不可逆地**替换为占位符，输出到新文件。**绝不联网、绝不上传、绝不覆盖原文件。**
 
-> ⚠️ 当前状态：**全部单元测试 645 passed, 0 xfailed**。
+> ⚠️ 当前状态：**全部单元测试 732 passed, 0 xfailed**。
 > **docx 已全通**：正文段落（跨 run、换行符、制表符）、超链接（含 `mailto:` 目标）、
 > 表格（含合并单元格与嵌套表）、页眉页脚（含首页/ 偶数页）、批注、
 > 文本框（含嵌套）、脚注、尾注。
-> **文本型 PDF 已通到 P3**：真 redaction（无文本层明确报错）、
-> 表格识别分级（P2）、**元数据清洗**（`/Info` 六字段 + XMP，P3）。
-> xlsx / pptx / OCR / GUI 尚未实现。详见下方「已知限制」与「路线图」。
+> **文本型 PDF 已通到 P3b**：真 redaction（无文本层明确报错）、
+> 表格识别分级（P2）、**元数据清洗**（`/Info` 六字段 + XMP，P3）、
+> **5 处结构藏身处**（书签/注释/链接/内嵌文件/表单域，P3b）。
+> **xlsx P2/P3 已实现**：14 类容器（v0.4.0）+ custom.xml / 数组公式（v0.5.0）。
+> pptx / OCR / GUI 尚未实现。详见下方「已知限制」与「路线图」。
 
 ---
 
@@ -265,6 +267,36 @@ URL，不是正文文本），因此不能按规则名反推。报告会显示 `
    若保留空壳，它在 Word 里是**零宽度**的——不渲染也选不中，
    用户会看到"格式似乎存在却点不中"的困惑。移除后空白自然并入相邻 run。
 
+### xlsx（P2 全通 + P3 补 custom.xml 与数组公式）
+
+**已处理**（v0.4.0 + v0.5.0）：
+14 类容器 = 单元格（字符串/数值/公式）、批注、页眉页脚、工作簿属性、
+定义名称、图表、隐藏工作表；外加 `docProps/custom.xml` 自定义属性、
+数组公式（扫字符串清洗，结构保留）。
+
+**未处理 / 会跳过的**（本版**不脱敏**或**数据丢失**，需人工核查）：
+
+| 位置 | 说明 |
+|---|---|
+| **`xl/tables/tableN.xml` 整目录丢失**（v0.5 实测） | openpyxl 重写 xlsx 时会把整 `xl/tables/` 目录吞掉。**非漏敏**：源里所有命名表（含表名、表头、列定义）一并消失。这是**数据丢失**，不是漏敏——敏感信息不会被替换为占位符，而是原数据被丢掉。若用户原文件依赖命名表（如 Excel 数据验证下拉、引用查询），输出后请人工重建 |
+| **`docProps/app.xml` TitlesOfParts 丢失**（v0.5 实测） | openpyxl 重写时 `app.xml` 的 `TitlesOfParts` 字段被简化（包含的工作表名/打印顺序/文档统计等元信息丢失）。**非漏敏**，仅 Excel 后台元数据损失，对内容无影响 |
+| **共享公式主格（`t="shared"` 带 `ref=`）** | openpyxl 读入时会自动把共享公式的引用格展开为独立公式，故本工具**只按普通公式清洗**。真 Excel 直改 ZIP 文件时主格 + 引用格独立公式都能清洗，但经过 openpyxl 中转会被自动展平。攻击场景需人工核查 |
+
+**xlsx 容器清单**（实测覆盖）：
+单元格（含数值/字符串/公式）、批注（独立 part `xl/comments*.xml`）、
+页眉页脚（openpyxl 高层 API，与 docx 类似）、工作簿属性（`docProps/core.xml`、
+`docProps/app.xml` 的可写字段）、定义名称（`wb.defined_names`）、图表
+（最后 save 后改 ZIP，因为 openpyxl 重写会丢图表关联）、隐藏工作表
+（`state='hidden'` / `'veryHidden'` 同样按内容清洗，只是位置标签标"（隐藏）"）。
+
+**两个特殊容器**：
+- `docProps/custom.xml`：P3 走 `wb.custom_doc_props.props` 高层 API。
+  StringProperty/LinkProperty 的 `name` 与 `value` 都跑引擎；IntProperty/
+  FloatProperty 走数值路径（含超精度告警）；BoolProperty/DateTimeProperty
+  跳过（无文本）。位置标签 `工作簿 自定义属性 {idx}`（**不带 name**，避免 name 本身含敏）。
+- 数组公式：P3 改"跳过 + 告警"为"扫字符串清洗，保留结构"。
+  用 `ArrayFormula(ref, new_text)` 重建，`ref="B1:B1"` 结构保留。
+
 ---
 
 ## 安装
@@ -468,7 +500,7 @@ LocalFileRedactor/
 
 | 项 | 状态 |
 |---|---|
-| 全部单元测试 | ✅ **645 passed, 0 xfailed**（原 /Info 元数据缺口的 xfail 已随 P3 修复转正） |
+| 全部单元测试 | ✅ **732 passed, 0 xfailed**（v0.5.0：xlsx P2/P3 + PDF P3b 累计） |
 | CLI 冒烟（dry-run / run / 规则加载） | ✅ 通过，退出码正确 |
 | 源文件不变性 | ✅ **SHA-256 前后一致** |
 | 跨 run 识别 | ✅ 拆在 3 个 run 的手机号正确命中 |
@@ -512,8 +544,9 @@ python tests/fixtures/make_docx_samples.py
 - [x] PDF-P1 文本型 PDF 真 redaction（无文本层明确报错，不做 OCR）
 - [x] PDF-P2 文本型 PDF 表格识别分级（有框线给行列号，无框线只给页码 + 坐标）
 - [x] PDF-P3 文本型 PDF 元数据清洗（`/Info` 六字段 + XMP，含跨节点告警）
-- [ ] PDF-P3b 文本型 PDF 另 5 处藏身处（书签 / 注释 / 链接 / 内嵌文件 / 表单域）
-- [ ] xlsx（数值单元格 str() 后匹配 + 批注 + 页眉页脚）
+- [x] PDF-P3b 文本型 PDF 另 5 处藏身处（书签 / 注释 / 链接 / 内嵌文件 / 表单域）— **PDF 文本层全通**
+- [x] xlsx-P2 14 类容器（单元格 / 批注 / 页眉页脚 / 工作簿属性 / 定义名称 / 图表 / 隐藏工作表）
+- [x] xlsx-P3 custom.xml 自定义属性 + 数组公式（扫字符串清洗，结构保留）
 - [ ] P4 GUI（PySide6 拖拽批量）
 - [ ] P5 pptx + 扫描件 PDF（RapidOCR ONNX）
 - [ ] P6 PyInstaller 打包 + 开源准备
