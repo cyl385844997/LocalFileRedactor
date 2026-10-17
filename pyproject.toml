@@ -33,6 +33,7 @@ dev = ["pytest>=7.4", "pyinstaller>=6.0"]
 
 [project.scripts]
 redactor = "redactor.cli:main"
+redactor-gui = "redactor.gui.main:main"
 
 [project.urls]
 Homepage = "https://github.com/your-name/local-file-redactor"
