@@ -3,11 +3,11 @@
 跑法（与本机其它 GUI 验证一致）：
     set PYTHONPATH=src;.verify_libs
     set QT_QPA_PLATFORM=offscreen
-    "E:/Program Files/python/python.exe" -m redactor.gui.e2e_v061
+    "E:/Program Files/python/python.exe" scripts/e2e_v061.py
 
 场景：拖拽 1 合法 + 1 非法 + 1 重复，验证 counts / 列表 / 日志 / 状态栏。
 
-本脚本是 v0.6.1 交付的 e2e 验证（deliverable #2），不进产品代码，
+本脚本是 v0.6.1 交付的 e2e 验证（deliverable #2），不入产品包（src/redactor/gui/），
 仅作开发期 / 验收期验证用。
 """
 

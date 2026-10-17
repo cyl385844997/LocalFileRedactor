@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-file-redactor"
 version = "0.1.0"
-description = "本地离线文件脱敏工具（docx/xlsx/pdf/pptx），不可逆替换敏感信息，绝不联网、绝不覆盖原文件"
+description = "本地离线文件脱敏工具（docx/xlsx/pdf），不可逆替换敏感信息，绝不联网、绝不覆盖原文件"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later" }

@@ -65,7 +65,7 @@ class DropZoneList(QtWidgets.QListView):
     """拖拽文件占位列表（v0.6.1：真正接收 + 过滤 + 去重）。
 
     白名单默认从 :func:`redactor.handlers.supported_extensions` 同步，
-    保证 GUI 与引擎一致；存在导入失败则退化到内置 4 元素 fallback。
+    保证 GUI 与引擎一致；存在导入失败则退化到内置 11 元素 fallback。
     """
 
     #: fallback 白名单（handlers 不可用时启用），与 REGISTRY 当前 11 项一致
