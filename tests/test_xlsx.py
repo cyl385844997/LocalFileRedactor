@@ -538,6 +538,163 @@ class TestProperties:
         assert "定义名称" in (res.message or "")
 
 
+# ============================================================ v0.5.0：自定义属性 + 数组公式
+PHONE_C = "13800138000"
+MAIL_C = "zhang.san@example.com"
+
+
+def _make_with_custom(path: Path) -> Path:
+    """造一份含 docProps/custom.xml 的样本（openpyxl 高层 API）。"""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "客户名单"
+    # 单元格也含敏感串（保证 P3 不退步）
+    ws["A1"] = f"客户{PHONE_C}"
+    # 4 个 custom properties 覆盖多类型
+    wb.custom_doc_props.append(_str_prop("客户姓名", "张三"))
+    wb.custom_doc_props.append(_str_prop("联系方式", MAIL_C))
+    wb.custom_doc_props.append(_str_prop("项目编号", PHONE_C))
+    wb.custom_doc_props.append(_bool_prop("审计状态", True))
+    wb.save(str(path))
+    wb.close()
+    return path
+
+
+def _str_prop(name: str, value: str):
+    """延迟导入以免污染模块顶部。"""
+    from openpyxl.packaging.custom import StringProperty
+    return StringProperty(name=name, value=value)
+
+
+def _bool_prop(name: str, value: bool):
+    from openpyxl.packaging.custom import BoolProperty
+    return BoolProperty(name=name, value=value)
+
+
+class TestCustomProperties:
+    """v0.5.0 自定义属性（docProps/custom.xml）清洗。
+
+    P2 完全未处理该 part，实测 100% 漏敏（手写 + xlsxwriter 双探针）。
+    P3 新增容器：name + value 都跑引擎；位置标签带序号不带 name
+    （name 可能本身就是敏感串）。
+    """
+
+    def test_自定义属性完全清洗(self, tmp_path):
+        src = _make_with_custom(tmp_path / "cp.xlsx")
+        out = tmp_path / "cp_out.xlsx"
+        res = process(src, out)
+
+        raw = part_bytes(out, "docProps/custom.xml")
+        assert raw != b"", "docProps/custom.xml 应被保留（不能丢 part）"
+        decoded = raw.decode("utf-8", "replace")
+        # phone 与 email 必须被清洗掉
+        assert PHONE_C not in decoded, f"custom.xml 残留手机号：{decoded}"
+        assert MAIL_C not in decoded, f"custom.xml 残留邮箱：{decoded}"
+        # 报告里应有"自定义属性"标签
+        labels = all_labels(res)
+        assert any("自定义属性" in x for x in labels), (
+            f"未报自定义属性：{labels}"
+        )
+
+    def test_自定义属性name含敏感串也被清(self, tmp_path):
+        """🔴 name 本体可能就是用户数据（'客户电话13800138000'）。"""
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        wb.custom_doc_props.append(_str_prop(f"客户电话{PHONE_C}", "无关值"))
+        wb.save(str(tmp_path / "cpn.xlsx"))
+        wb.close()
+
+        out = tmp_path / "cpn_out.xlsx"
+        res = process(tmp_path / "cpn.xlsx", out)
+
+        raw = part_bytes(out, "docProps/custom.xml").decode("utf-8", "replace")
+        assert PHONE_C not in raw, f"自定义属性 name 残留敏感串：{raw}"
+        # 报告里应有 1 处自定义属性命中
+        labels = all_labels(res)
+        assert any("自定义属性" in x for x in labels), (
+            f"未报自定义属性：{labels}"
+        )
+
+    def test_未造custom_property时不应有自定义属性报告(self, tmp_path):
+        """当文档没有 custom property 时 P3 路径不应强行创建。"""
+        # 不创建任何 custom property
+        src = make_full(tmp_path / "nocp.xlsx", include_chart=False)
+        out = tmp_path / "nocp_out.xlsx"
+        res = process(src, out)
+
+        # 不应含 "自定义属性" 命中（因为 make_full 没造）
+        msg = res.message or ""
+        assert "自定义属性" not in msg, (
+            f"未造 custom property 却报自定义属性命中：{msg}"
+        )
+
+
+def _make_with_array_formula(path: Path) -> Path:
+    """造一份含数组公式（CONCATENATE 含敏感串）的样本。
+
+    P2（旧版）完全跳过 + 告警 → 实测 v0.4.0 漏敏。
+    P3 改为扫 .text 字符串清洗，保留 .ref 结构。
+    """
+    from openpyxl import Workbook
+    from openpyxl.worksheet.formula import ArrayFormula
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "数组测试"
+    ws["A1"] = "干净格子"
+
+    # 数组公式含敏感串（邮箱）
+    ws["B1"] = ArrayFormula(
+        "B1:B1",
+        f'=CONCATENATE("e","{MAIL_C}")',
+    )
+    # 普通公式（不在数组）
+    ws["C1"] = f'=CONCATENATE("电话","{PHONE_C}")'
+    wb.save(str(path))
+    wb.close()
+    return path
+
+
+class TestArrayFormula:
+    """v0.5.0 数组公式（``ArrayFormula``）扫描字符串清洗（D2 裁定 A：保留结构）。"""
+
+    def test_数组公式含敏感串时实测清洗(self, tmp_path):
+        src = _make_with_array_formula(tmp_path / "af.xlsx")
+        out = tmp_path / "af_out.xlsx"
+        process(src, out)
+
+        # 反向对照：源 zip 仍含敏感串（确认前置样本有效）
+        with zipfile.ZipFile(src) as z:
+            src_raw = z.read("xl/worksheets/sheet1.xml").decode("utf-8", "replace")
+        assert MAIL_C in src_raw, (
+            f"源样本前置缺失敏感串 → 反向对照失败：{src_raw[:200]}"
+        )
+
+        out_raw = sheet_bytes(out, 1).decode("utf-8", "replace")
+        assert MAIL_C not in out_raw, (
+            f"数组公式仍含邮箱：ref 结构保留但 .text 未清\n{out_raw}"
+        )
+
+        # 结构保留：t="array" ref="..." 仍在
+        assert 't="array"' in out_raw, "数组公式结构被破坏"
+        assert 'ref="B1:B1"' in out_raw, "数组公式 ref 被破坏"
+
+    def test_数组公式在报告里标数组公式(self, tmp_path):
+        """报告里应明确标'数组公式'载体，便于审计。"""
+        src = _make_with_array_formula(tmp_path / "af.xlsx")
+        out = tmp_path / "af_out.xlsx"
+        res = process(src, out)
+        labels = all_labels(res)
+        # 找含 '数组公式' 的位置标签
+        array_label = [x for x in labels if "数组公式" in x]
+        assert array_label, (
+            f"数组公式未在报告里标识：labels={labels}"
+        )
+
+
 # ============================================================ 报告集成
 class TestReport:
     def test_位置标签不含用户数据(self, tmp_path):
@@ -823,3 +980,50 @@ class TestMutations:
         assert _significant_digits(float(sci.group(1))) > (
             MAX_SIGNIFICANT_DIGITS
         ), "超精度值被降成了低精度（说明被错误地当成可清项）"
+
+    def test_变异_custom_properties_noop(self, monkeypatch, tmp_path):
+        """把 custom_properties 改成 noop → 产物里的 phone 必须仍在。
+
+        这条变异锁住：custom.xml 100% 漏敏是 P2 的真漏洞，本测试是
+        它真正的探测，不是"改了名字也算改了"的恒真。
+        """
+        import redactor.handlers.xlsx_structures as xs
+
+        def _bad_cp(wb, engine, col, *, dry_run):
+            return  # noop：不读不写
+
+        monkeypatch.setattr(xs, "_scrub_custom_properties", _bad_cp)
+
+        src = _make_with_custom(tmp_path / "m_cp.xlsx")
+        out = tmp_path / "m_cp_out.xlsx"
+        process(src, out)
+
+        raw = part_bytes(out, "docProps/custom.xml").decode("utf-8", "replace")
+        assert PHONE_C in raw, (
+            "变异成 noop 后 phone 居然被清洗了 → 本测试前提（漏敏）"
+            "不成立 —— 变异无鉴别力"
+        )
+
+    def test_变异_array_formula_noop(self, monkeypatch, tmp_path):
+        """把数组公式清洗改成 noop → 产物里的邮箱必须仍在。
+
+        P2 时代的实现就是"noop + 告警"，实测邮箱漏敏。
+        本变异直接对 noop 行为进行反向验证。
+        """
+        import redactor.handlers.xlsx_structures as xs
+
+        def _bad_af(ws, sheet_seq, cell, hidden, engine, col):
+            col.warnings.append(f"工作表 {sheet_seq}!{cell.coordinate} 是数组公式，**未修改**")
+            return  # noop
+
+        monkeypatch.setattr(xs, "_scrub_array_formula_cell", _bad_af)
+
+        src = _make_with_array_formula(tmp_path / "m_af.xlsx")
+        out = tmp_path / "m_af_out.xlsx"
+        process(src, out)
+
+        raw = sheet_bytes(out, 1).decode("utf-8", "replace")
+        assert MAIL_C in raw, (
+            "变异成 noop 后邮箱被清洗了 → 本测试前提（漏敏）"
+            "不成立 —— 变异无鉴别力"
+        )

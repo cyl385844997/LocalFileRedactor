@@ -65,6 +65,7 @@ __all__ = [
     "XlsxScrubResult",
     "chart_label",
     "comment_label",
+    "custom_property_label",
     "defined_name_label",
     "headerfooter_label",
     "property_label",
@@ -147,15 +148,19 @@ def _escape(text: str) -> bytes:
 # 🔴 安全红线：标签**不含任何用户数据**。sheet 名尤其危险 ——
 #    用户完全可能把手机号写进工作表名。故一律用序号。
 def sheet_label(seq: int, coord: str, *, hidden: bool = False,
-                 merge: str = "", formula: bool = False) -> str:
-    """单元格的位置标签，如 ``工作表 3!A1`` / ``工作表 3（隐藏）!B1``。
+                 merge: str = "", formula: bool = False,
+                 array: bool = False) -> str:
+    """单元格的位置标签，如 ``工作表 3!A1`` / ``工作表 3（隐藏）!B1`` /
+    ``工作表 1!B1（数组公式）``。
 
     Args:
         seq: 工作表序号（从 1 开始）。
         coord: 单元格坐标（如 ``A1``）。**坐标不是用户数据**，可安全展示。
         hidden: 该表是否为隐藏/veryHidden。
         merge: 合并区描述（如 ``B1:D1``），为空表示不合并。
-        formula: 该格是否为公式。
+        formula: 该格是否为公式（普通公式）。
+        array: 该格是否为**数组公式**（与 ``formula`` 不能同时为 True，
+            数组公式优先）。
 
     Returns:
         紧凑标签。刻意用 ``!`` 连接——这是 Excel 的通用记法，
@@ -166,7 +171,11 @@ def sheet_label(seq: int, coord: str, *, hidden: bool = False,
     extra = []
     if merge:
         extra.append(f"含合并区 {merge}")
-    if formula:
+    # 🔴 数组公式标签必须区别于普通公式：用户配置"数组公式"专属规则时
+    # 报告会按标签筛选
+    if array:
+        extra.append("数组公式")
+    elif formula:
         extra.append("公式")
     return f"{base}（{'，'.join(extra)}）" if extra else base
 
@@ -231,6 +240,16 @@ def defined_name_label() -> str:
     🔴 **刻意不带名称本身** —— 定义名称可能是 ``客户_张三`` 这类用户数据。
     """
     return "工作簿 定义名称"
+
+
+def custom_property_label(idx: int) -> str:
+    """自定义属性的位置标签。
+
+    自定义属性的**名字**本身也可能是用户数据（如 ``客户_张三``、
+    ``客户电话13800138000``），故标签**只携带序号**，不携带 name 值。
+    报告里"具体哪条属性被清洗"由 ``idx``（在 props 列表中的位置）唯一定位。
+    """
+    return f"工作簿 自定义属性 {idx}"
 
 
 # ------------------------------------------------------------------ 结果
@@ -418,20 +437,12 @@ def _scrub_cells(
         for cell in _iter_cells(ws):
             value = cell.value
 
-            # --- 容器 3：公式 ---
+# --- 容器 3：公式（含普通公式与数组公式）---
             if cell.data_type == "f" or (
                 isinstance(value, str) and value.startswith("=")
             ):
                 _scrub_formula_cell(
                     ws, sheet_seq, cell, hidden, engine, col
-                )
-                continue
-
-            # --- 数组公式：value 不是字符串，强转会坏 ---
-            if value.__class__.__name__ == "ArrayFormula":
-                col.warnings.append(
-                    f"工作表 {sheet_seq}!{cell.coordinate} 是数组公式，"
-                    f"**未修改**，请人工核查该公式是否含敏感信息"
                 )
                 continue
 
@@ -525,24 +536,23 @@ def _scrub_formula_cell(
     """容器 3：公式单元格。
 
     公式里的**字符串常量**确实含敏感串（实测
-    ``=CONCATENATE("手机","13800138000")``、``=IF(A1="13800138000",1,2)``
+    ``=CONCATENATE("手机","13800138000")``、``=IF(A1="13800139000",1,2)``
     都能命中）→ 必须按公式字符串清洗。
-
-    一类**不可强改**的情形，必须显式告警：
-      - **数组公式**：``value`` 是对象不是字符串 → 跳过。
 
     关于"共享公式的引用格"（``<f t="shared" si="N"/>`` 无 ``ref=``）：
     **openpyxl 默认会把它们展开为独立公式**（实测：build_sample 输出里
     出现 ``t="shared"`` 次数=0，引用格被翻译成具体公式表达式），
     因此本模块**不再特判引用格** —— 引用格与普通公式走同一清洗路径，
     不告警、不跳过。
+
+    数组公式（含 ``<f t="array" ref="...">``）通过 :func:`_scrub_array_formula_cell`
+    单独处理（保留 ``ref`` 结构 + 清洗 ``text``）。
     """
     value = cell.value
 
     if value.__class__.__name__ == "ArrayFormula":
-        col.warnings.append(
-            f"工作表 {sheet_seq}!{cell.coordinate} 是数组公式，"
-            f"**未修改**，请人工核查该公式是否含敏感信息"
+        _scrub_array_formula_cell(
+            ws, sheet_seq, cell, hidden, engine, col
         )
         return
 
@@ -559,6 +569,63 @@ def _scrub_formula_cell(
     )
     col.add(matches, label)
     col.bump("公式", len(matches))
+
+
+def _scrub_array_formula_cell(
+    ws: Any, sheet_seq: int, cell: Any, hidden: bool,
+    engine: RedactionEngine, col: _Collector,
+) -> None:
+    """容器 3b：数组公式（D2 裁定"扫字符串清洗，保留结构"）。
+
+    ArrayFormula 对象的 ``value`` 不是字符串，而是
+    ``openpyxl.worksheet.formula.ArrayFormula``，有 ``.text`` 与 ``.ref``。
+
+    P2（旧版）实现为**跳过 + 告警**，实测 v0.4.0 漏敏：
+        ``B1 = ArrayFormula('B1', '=CONCATENATE("e","zhang.san@example.com")')``
+        过 P2 后文件里邮箱仍残留。Marvis 复核整改要求"扫字符串清洗"。
+
+    新版：
+      1. 取 ``.text`` 走 engine.redact
+      2. 若有命中：用 :class:`ArrayFormula` 原 ``.ref`` 重建，文本替换
+      3. ``.ref`` 保留 —— 数组公式的空间结构不被破坏
+
+    风险与代价：
+      - **.ref 多格** 数组公式（实测场景罕见）：仍只清洗主格显示文本，
+        引用格 OpenPyXL 会同步展开（v0.4 探测确认）。
+      - **Python 3 内 AttributeError**：若 ArrayFormula API 缺失字段
+        → 走 except + 告警，不动文件。
+    """
+    value = cell.value
+    text = getattr(value, "text", None)
+    ref = getattr(value, "ref", None)
+    if not isinstance(text, str):
+        # 异常形态：可能是空公式或解析失败 → 跳过 + 告警
+        col.warnings.append(
+            f"工作表 {sheet_seq}!{cell.coordinate} 是数组公式但解析失败"
+            f"（无 .text 字段），**未修改**，请人工核查"
+        )
+        return
+
+    new_text, matches = engine.redact(text)
+    if not matches:
+        return
+
+    try:
+        from openpyxl.worksheet.formula import ArrayFormula
+        cell.value = ArrayFormula(ref, new_text)
+    except Exception as exc:  # noqa: BLE001
+        col.warnings.append(
+            f"工作表 {sheet_seq}!{cell.coordinate} 数组公式清洗失败"
+            f"（{type(exc).__name__}），**未修改**，请人工核查"
+        )
+        return
+
+    label = sheet_label(
+        sheet_seq, cell.coordinate, hidden=hidden,
+        array=True, merge=_merge_range_of(ws, cell),
+    )
+    col.add(matches, label)
+    col.bump("数组公式", len(matches))
 
 
 # ------------------------------------------------------------------ 4. 批注
@@ -815,6 +882,155 @@ def _scrub_defined_names(
             )
 
 
+def _scrub_custom_properties(
+    wb: Any, engine: RedactionEngine, col: _Collector, *, dry_run: bool
+) -> None:
+    """容器 7c：自定义属性（D1 裁定"必补"）。
+
+    实测手写 ZIP 与 xlsxwriter ``set_custom_property()`` 两种产物形态：
+      - ``docProps/custom.xml`` 含 ``<property name="客户姓名"><vt:lpwstr>张三</vt:lpwstr></property>``
+      - 也可能含 ``<vt:i4>`` / ``<vt:bool>`` / ``<vt:filetime>`` 等数值类型
+
+    P2（旧版）**完全未处理**该 part，实测 100% 漏敏：
+    ``source=张三 13800138000 / zhang.san@example.com`` → 输出两个串都在。
+
+    新版走 openpyxl 高层 API ``wb.custom_doc_props.props``：
+      - **StringProperty / LinkProperty**：``name`` 与 ``.value`` 都跑
+        ``engine.redact``。name 是用户数据，常见 ``客户电话13800138000``。
+      - **IntProperty / FloatProperty**：整数或浮点数走数值型清洗路径
+        （``_significant_digits`` + 超精度告警）。注意 openpyxl
+        ``IntProperty.value`` 是 ``int``、``FloatProperty.value`` 是
+        ``float``，与 :func:`_scrub_number_cell` 同型。
+      - **DateTimeProperty**：value 是 ``datetime``，含日期无敏感性，跳过。
+      - **BoolProperty**：value 是 ``bool``，无敏感性，跳过。
+
+    🔴 **PID/name 关联**：OOXML 中 ``property.pid`` 与 ``name`` 是
+    独立字段，但同 part 内 name 应唯一。实测改 ``name`` 后整段再写
+    openpyxl 不报错，且重读一致 —— 验证见 probe_p3_xlsx_xlsxwriter_custom.py。
+
+    🔴 **位置标签不带 name**：name 本身可能含敏感串，参考
+    :func:`defined_name_label` 同一思路，只带序号。
+    """
+    props = getattr(wb, "custom_doc_props", None)
+    if props is None:
+        return
+    items = getattr(props, "props", None)
+    if not items:
+        return
+
+    from openpyxl.packaging.custom import (
+        BoolProperty,
+        DateTimeProperty,
+        FloatProperty,
+        IntProperty,
+        LinkProperty,
+        StringProperty,
+    )
+
+    type_to_label_part = {
+        StringProperty: "自定义属性（字符串）",
+        LinkProperty: "自定义属性（链接）",
+        IntProperty: "自定义属性（整数）",
+        FloatProperty: "自定义属性（浮点数）",
+    }
+
+    for idx, prop in enumerate(items, start=1):
+        cls = type(prop)
+
+        # --- 字符串型（name + value 都跑引擎） ---
+        if isinstance(prop, (StringProperty, LinkProperty)):
+            # name
+            raw_name = getattr(prop, "name", None)
+            if isinstance(raw_name, str) and raw_name:
+                new_name, nm = engine.redact(raw_name)
+                if nm and not dry_run:
+                    prop.name = new_name
+                if nm:
+                    col.add(nm, custom_property_label(idx))
+                    col.bump(type_to_label_part[cls], len(nm))
+            # value
+            raw_value = getattr(prop, "value", None)
+            if isinstance(raw_value, str) and raw_value:
+                new_value, vm = engine.redact(raw_value)
+                if vm and not dry_run:
+                    prop.value = new_value
+                if vm:
+                    col.add(vm, custom_property_label(idx))
+                    col.bump(type_to_label_part[cls], len(vm))
+            continue
+
+        # --- 数值型（整数） ---
+        if isinstance(prop, IntProperty):
+            raw_value = getattr(prop, "value", None)
+            if not isinstance(raw_value, int) or isinstance(raw_value, bool):
+                continue
+            text = str(raw_value)
+            digits = _significant_digits(raw_value)
+            if digits > MAX_SIGNIFICANT_DIGITS:
+                col.warnings.append(
+                    f"工作簿 自定义属性 {idx}（整数，{digits} 位）"
+                    f"超过 {MAX_SIGNIFICANT_DIGITS} 位精度，精度不可逆，"
+                    f"**未自动脱敏**，请人工核查"
+                )
+                continue
+            new_text, matches = engine.redact(text)
+            if not matches:
+                continue
+            if not dry_run:
+                try:
+                    prop.value = int(new_text)
+                except (TypeError, ValueError):
+                    col.warnings.append(
+                        f"工作簿 自定义属性 {idx}（整数）无法转回数值"
+                        f"（'{new_text}'），**未修改**"
+                    )
+                    continue
+            col.add(matches, custom_property_label(idx))
+            col.bump(type_to_label_part[cls], len(matches))
+            continue
+
+        # --- 数值型（浮点） ---
+        if isinstance(prop, FloatProperty):
+            raw_value = getattr(prop, "value", None)
+            if not isinstance(raw_value, float):
+                continue
+            text = repr(raw_value)
+            digits = _significant_digits(raw_value)
+            if digits > MAX_SIGNIFICANT_DIGITS:
+                # 浮点超精度：整列告警，不强改
+                col.warnings.append(
+                    f"工作簿 自定义属性 {idx}（浮点，{digits} 位）"
+                    f"超过 {MAX_SIGNIFICANT_DIGITS} 位精度，精度不可逆，"
+                    f"**未自动脱敏**，请人工核查"
+                )
+                continue
+            new_text, matches = engine.redact(text)
+            if not matches:
+                continue
+            if not dry_run:
+                try:
+                    prop.value = float(new_text)
+                except (TypeError, ValueError):
+                    col.warnings.append(
+                        f"工作簿 自定义属性 {idx}（浮点）无法转回数值"
+                        f"（'{new_text}'），**未修改**"
+                    )
+                    continue
+            col.add(matches, custom_property_label(idx))
+            col.bump(type_to_label_part[cls], len(matches))
+            continue
+
+        # --- 日期 / 布尔：通常无敏感性，跳过 ---
+        if isinstance(prop, (BoolProperty, DateTimeProperty)):
+            continue
+
+        # --- 未知类型：告警让用户人工核查 ---
+        col.warnings.append(
+            f"工作簿 自定义属性 {idx}（类型 {cls.__name__}）不在已知清洗路径，"
+            f"**未处理**，请人工核查"
+        )
+
+
 # ------------------------------------------------------------------ 入口
 def scrub_structures(
     wb: Any,
@@ -823,7 +1039,8 @@ def scrub_structures(
     start_seq: int = 0,
     dry_run: bool = False,
 ) -> XlsxScrubResult:
-    """清洗 xlsx 的 6 类**内存态**容器（单元格/批注/页眉页脚/属性/定义名称）。
+    """清洗 xlsx 的 **7 类内存态容器**（v0.5.0 + custom.xml）：
+    单元格 / 批注 / 页眉页脚 / 属性 / 定义名称 / **自定义属性**。
 
     Args:
         wb: :class:`openpyxl.Workbook`（**会被就地修改**）。
@@ -838,6 +1055,8 @@ def scrub_structures(
         **图表不在这里处理** —— 它必须读磁盘上的 ``chart*.xml``，
         只能在 handler 完成最后一次 ``save()`` 之后做，
         见 :func:`scrub_chart_parts`。混进来会导致"改了又被覆盖"。
+        **自定义属性可在这里处理** —— openpyxl 高层 API（``wb.custom_doc_props``）
+        直接改内存对象，下一次 ``wb.save()`` 自然写出。
     """
     col = _Collector(engine, start_seq=start_seq)
 
@@ -846,6 +1065,7 @@ def scrub_structures(
     _scrub_header_footer(wb, engine, col, dry_run=dry_run)
     _scrub_properties(wb, engine, col, dry_run=dry_run)
     _scrub_defined_names(wb, engine, col, dry_run=dry_run)
+    _scrub_custom_properties(wb, engine, col, dry_run=dry_run)
 
     return XlsxScrubResult(
         matches=col.matches,
