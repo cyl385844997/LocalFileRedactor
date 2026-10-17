@@ -287,7 +287,32 @@ class TestRedactionWorker:
         assert not (out_root / "f1_redacted.docx").exists()
 
     def test_每个文件跑完立刻emit_file_done_不等汇总(self, qapp, tmp_path: Path):
-        """用户要求：每文件跑完立刻 emit file_done，防崩溃丢结果。"""
+        """用户要求：每文件跑完立刻 emit file_done，防崩溃丢结果。
+
+        ⚠️ 本测试在 2026-10-18 修正过一次**判据**（原判据是假阳性，Marvis 抓出）：
+        原写法 ``assert finished_ts[0] >= timestamps[-1]`` 在"批量汇总"变异版下
+        **同样成立**（批量版在循环后连发 file_done 再发 finished），
+        所以它无法区分"每文件即时发"与"最后批量发"——是个恒真断言。
+
+        现用两个互相独立、都有真鉴别力的判据：
+
+        **判据 A（主）：事件序列形状**——取证对象是 worker 实际发出的事件流，
+        断言 progress / file_done 必须交错出现::
+
+            真版（每文件即时发）:  P0 D P1 D P2 D F
+            批量汇总变异版:        P0 P1 P2 D D D F   ← 形状不同，断言红
+
+        **判据 B（辅）：计数器快照**——Marvis 建议"第 2 个文件开始的时间 >
+        第 1 个 file_done 发出的时间"，但 Windows 的 ``time.monotonic()``
+        分辨率只有 ~15.6ms（实测 3 个文件跑完时间戳完全相同），
+        **时序断言在此机器上不可用**。改用离散可数的等价物：
+        记录"每次 progress 到达时，已经收到几个 file_done"::
+
+            真版:   P0@fd=0, D, P1@fd=1, D, P2@fd=2, D, F
+            批量版: P0@fd=0,    P1@fd=0, P2@fd=0, D, D, D, F   ← fd 计数不递增 → 红
+
+        即：第 i 个 progress 到达时，file_done 计数必须恰好是 i。
+        """
         paths: List[str] = []
         for i in range(3):
             p = tmp_path / f"f{i}.docx"
@@ -298,18 +323,128 @@ class TestRedactionWorker:
 
         worker = RedactionWorker(paths, out_root, dry_run=False, engine=engine)
 
-        # 收集 file_done 的"瞬时"时间戳
-        timestamps: List[float] = []
-        worker.file_done.connect(lambda r: timestamps.append(time.monotonic()))
-        finished_ts: List[float] = []
-        worker.finished.connect(lambda: finished_ts.append(time.monotonic()))
+        # ---- 取证：worker 实际发出的事件流 + fd 计数快照 ----
+        events: List[str] = []
+        fd_seen_at_progress: List[int] = []
+        fd_count = [0]
+
+        def on_progress(idx: int, total: int, name: str) -> None:
+            fd_seen_at_progress.append(fd_count[0])
+            events.append(f"P{idx}@fd={fd_count[0]}")
+
+        def on_file_done(r: FileResult) -> None:
+            fd_count[0] += 1
+            events.append("D")
+
+        worker.progress.connect(on_progress)
+        worker.file_done.connect(on_file_done)
+        worker.finished.connect(lambda: events.append("F"))
 
         worker.process()
 
-        # file_done 3 个，finished 1 个；finished 时间 > 所有 file_done 时间
-        assert len(timestamps) == 3
-        assert len(finished_ts) == 1
-        assert finished_ts[0] >= timestamps[-1]  # finished 是最后发的
+        # ---- 判据 A：事件序列形状（progress 与 file_done 必须交错）----
+        expected = [
+            "P0@fd=0", "D", "P1@fd=1", "D", "P2@fd=2", "D", "F",
+        ]
+        assert events == expected, (
+            f"事件序列形状不符：\n"
+            f"  期望（每文件即时发）: {expected}\n"
+            f"  实测:                {events}\n"
+            f"若实测 fd 计数全为 0（如 P0@fd=0,P1@fd=0,P2@fd=0,D,D,D,F），"
+            f"说明 file_done 被改成批量汇总——回归。"
+        )
+
+        # ---- 判据 B：计数器快照（第 i 个 progress 时已收到 i 个 file_done）----
+        assert fd_seen_at_progress == [0, 1, 2], (
+            f"fd 计数快照不符（期望 [0,1,2]）：{fd_seen_at_progress}\n"
+            f"批量汇总版会是 [0,0,0]（所有 progress 都早于任何 file_done）。"
+        )
+        assert fd_count[0] == 3, f"应收到 3 个 file_done，实收 {fd_count[0]}"
+        assert events[-1] == "F", "finished 必须是最后一个事件"
+
+    def test_批量汇总变异版_守护测试必须失败(self, qapp, tmp_path: Path, monkeypatch):
+        """变异测试：把 file_done 改成批量汇总 → 上面的守护测试必须红。
+
+        本测试**主动验证守护测试有鉴别力**（防止它退化成恒真断言）。
+        做法：monkeypatch 一个"批量汇总"版 process，然后**跑一遍守护测试的判据**，
+        断言该判据对批量版**不成立**。
+
+        注意：不通过 subprocess 重跑 pytest（那样太慢且拿不到判据对象），
+        而是复用同一判据函数——判据本身是纯断言，不含生成条件。
+        """
+        from redactor.gui import worker as worker_mod
+
+        def batched_process(self) -> None:
+            """批量汇总变异版：所有结果扣在循环里，最后一起 emit。"""
+            total = len(self._paths)
+            results = []
+            for idx, p in enumerate(self._paths):
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    self.finished.emit()
+                    return
+                name = Path(p).name
+                self.progress.emit(idx, total, name)
+                result = process_one_for_gui(
+                    Path(p), self._output_root, self._input_root,
+                    self._engine, self._dry_run, overwrite_output=self._overwrite_output,
+                )
+                results.append(result)
+            # ← 变异点：file_done 移到循环外
+            for r in results:
+                self.file_done.emit(r)
+            self.finished.emit()
+
+        monkeypatch.setattr(worker_mod.RedactionWorker, "process", batched_process)
+
+        paths: List[str] = []
+        for i in range(3):
+            p = tmp_path / f"f{i}.docx"
+            _make_docx(p)
+            paths.append(str(p))
+        out_root = tmp_path / "out"
+        engine = build_engine_for_gui()
+
+        worker = RedactionWorker(paths, out_root, dry_run=False, engine=engine)
+        events: List[str] = []
+        fd_seen_at_progress: List[int] = []
+        fd_count = [0]
+
+        def on_progress(idx: int, total: int, name: str) -> None:
+            fd_seen_at_progress.append(fd_count[0])
+            events.append(f"P{idx}@fd={fd_count[0]}")
+
+        worker.progress.connect(on_progress)
+        worker.file_done.connect(lambda r: (fd_count.__setitem__(0, fd_count[0] + 1), events.append("D")))
+        worker.finished.connect(lambda: events.append("F"))
+
+        worker.process()
+
+        expected = [
+            "P0@fd=0", "D", "P1@fd=1", "D", "P2@fd=2", "D", "F",
+        ]
+
+        # 判据 A 对批量版**必须不成立**——否则说明守护测试没鉴别力
+        assert events != expected, (
+            f"❌ 判据无鉴别力：批量汇总版事件序列竟然等于真版期望 {expected}。"
+            f"实测 = {events}。守护测试已退化成恒真断言。"
+        )
+        # 批量版的实际形状（供交付报告引用）
+        assert events == ["P0@fd=0", "P1@fd=0", "P2@fd=0", "D", "D", "D", "F"], events
+
+        # 判据 B（fd 计数快照）对批量版**必须不成立**
+        assert fd_seen_at_progress != [0, 1, 2], (
+            f"❌ 判据 B 无鉴别力：批量版 fd 快照竟然 == [0,1,2]，实测 {fd_seen_at_progress}"
+        )
+        assert fd_seen_at_progress == [0, 0, 0], (
+            f"批量版的 fd 快照应为 [0,0,0]（所有 progress 都早于任何 file_done），"
+            f"实测 {fd_seen_at_progress}"
+        )
+
+        # 补充：批量版**确实写出了全部输出文件**（说明它真跑了，不是空跑）
+        assert (out_root / "f0_redacted.docx").exists()
+        assert (out_root / "f1_redacted.docx").exists()
+        assert (out_root / "f2_redacted.docx").exists()
 
 
 # ============================================================ C. RedactorController
@@ -567,15 +702,20 @@ class TestEndToEndProcess:
 class TestReverseValidation:
     """变异代码后断言必须真失败 —— 防止"对照组漏检 100%"。"""
 
-    def test_cooperative_cancel改成强杀_取消测试真失败(self, qapp, tmp_path: Path, monkeypatch):
-        """变异：把 worker.process 改为不检查 _cancel_requested → 取消测试必须失败。"""
+    def test_cooperative_cancel改成强杀_守护测试真失败(self, qapp, tmp_path: Path, monkeypatch):
+        """变异：把 worker.process 改成"强杀"（不检查 _cancel_requested）→ **守护测试必须红**。
+
+        ⚠️ 与 file_done 那条同样的自证式陷阱（2026-10-18 Marvis 抓出同类问题后一并修）：
+        原写法只断言"变异版 cancelled=0、文件全跑完"——这是**变异版自己的特征**，
+        没有断言"真版的守护测试会红"，等于没校验守护测试。
+
+        现改为真鉴别力：跑真版的守护判据
+        （``test_取消_第2个文件前取消_前1个保留``），断言它对强杀版**不成立**。
+        """
         from redactor.gui import worker as worker_mod
 
-        # 保存原始 process
-        original_process = worker_mod.RedactionWorker.process
-
         def hard_kill_process(self) -> None:
-            """变异版：不检查 _cancel_requested，每个文件都跑完。"""
+            """强杀变异版：不检查 _cancel_requested，每个文件都跑完。"""
             total = len(self._paths)
             for idx, p in enumerate(self._paths):
                 name = Path(p).name
@@ -591,7 +731,6 @@ class TestReverseValidation:
 
         monkeypatch.setattr(worker_mod.RedactionWorker, "process", hard_kill_process)
 
-        # 准备 2 个文件 + 取消钩子
         paths: List[str] = []
         for i in range(2):
             p = tmp_path / f"f{i}.docx"
@@ -602,28 +741,49 @@ class TestReverseValidation:
 
         worker = RedactionWorker(paths, out_root, dry_run=False, engine=engine)
         cancelled_count = [0]
-        worker.cancelled.connect(lambda: cancelled_count.__setitem__(0, cancelled_count[0] + 1))
         file_done_count = [0]
+        worker.cancelled.connect(lambda: cancelled_count.__setitem__(0, cancelled_count[0] + 1))
         worker.file_done.connect(lambda r: file_done_count.__setitem__(0, file_done_count[0] + 1))
 
-        # 跑前取消
-        worker.request_cancel()
+        # ---- 真版守护测试的判据（test_取消_第2个文件前取消_前1个保留 的核心断言）----
+        def on_first_done(r: FileResult) -> None:
+            worker.request_cancel()   # 第 1 个跑完立刻取消
+
+        worker.file_done.connect(on_first_done)
         worker.process()
 
-        # 变异后应该：cancelled 不发、2 个 file_done 全跑完
-        # —— 这与"协同取消"的语义矛盾
-        assert cancelled_count[0] == 0, "变异后取消了？"
-        assert file_done_count[0] == 2, "变异后没跑完所有文件？"
-        # 反向断言：变异版不再尊重取消请求
-        assert (out_root / "f1_redacted.docx").exists(), "变异后第 2 个文件不应被生成"
+        # 判据 1：真版守护测试断言 cancelled==1，强杀版不发 → 守护测试红
+        assert cancelled_count[0] != 1, (
+            f"❌ 守护测试无鉴别力：强杀版竟然发了 cancelled={cancelled_count[0]} 次。"
+        )
+        assert cancelled_count[0] == 0, "强杀版应不发 cancelled"
+
+        # 判据 2：真版守护测试断言"第 2 个不产出"，强杀版产出 → 守护测试红
+        # （强杀版不检查取消，2 个文件都会跑完）
+        assert (out_root / "f0_redacted.docx").exists(), "第 1 个应产出"
+        assert (out_root / "f1_redacted.docx").exists(), (
+            "强杀版**会**产出第 2 个文件——真版守护测试的 "
+            "``assert not (out_root/'f1_redacted.docx').exists()`` 因此**会红**（我们想要的）"
+        )
+
+        # 确认强杀版"真跑了"（2 个文件都产出），不是空跑导致断言侥幸成立
+        assert file_done_count[0] == 2, "强杀版应跑完 2 个文件"
 
         # monkeypatch 自动还原 worker_mod.RedactionWorker.process
 
-    def test_file_done_改为批量汇总_每文件测试真失败(self, qapp, tmp_path: Path, monkeypatch):
-        """变异：把 file_done 移到循环结束后统一发 → 每个文件跑完立刻发的测试应失败。"""
-        from redactor.gui import worker as worker_mod
+    def test_file_done_改为批量汇总_守护测试真失败(self, qapp, tmp_path: Path, monkeypatch):
+        """变异：把 file_done 移到循环结束后统一发 → **守护测试的判据必须红**。
 
-        original_process = worker_mod.RedactionWorker.process
+        ⚠️ 本测试在 2026-10-18 重写（原版是假阳性，Marvis 抓出）：
+        原写法 ``assert span < 0.005`` 只断言"变异后跨度小"，
+        **没有断言"真版跨度大"**——等于只验证变异版自己的特征，
+        守护测试（``test_每个文件跑完立刻emit_file_done_不等汇总``）
+        依然可能恒真通过。
+
+        现改为**真鉴别力**：直接跑守护测试用的那条判据
+        （事件序列形状），断言它对批量版**不成立**。
+        """
+        from redactor.gui import worker as worker_mod
 
         def batched_process(self) -> None:
             """变异版：collect 所有 result，循环结束后一次性 emit。"""
@@ -648,7 +808,6 @@ class TestReverseValidation:
 
         monkeypatch.setattr(worker_mod.RedactionWorker, "process", batched_process)
 
-        # 跑 3 个文件；验证 file_done 全部在 finished 之前发（不是循环外）
         paths: List[str] = []
         for i in range(3):
             p = tmp_path / f"f{i}.docx"
@@ -658,19 +817,41 @@ class TestReverseValidation:
         engine = build_engine_for_gui()
 
         worker = RedactionWorker(paths, out_root, dry_run=False, engine=engine)
-        timestamps: List[float] = []
-        worker.file_done.connect(lambda r: timestamps.append(time.monotonic()))
-        finished_ts: List[float] = []
-        worker.finished.connect(lambda: finished_ts.append(time.monotonic()))
+        events: List[str] = []
+        fd_seen_at_progress: List[int] = []
+        fd_count = [0]
+
+        def on_progress(idx: int, total: int, name: str) -> None:
+            fd_seen_at_progress.append(fd_count[0])
+            events.append(f"P{idx}@fd={fd_count[0]}")
+
+        worker.progress.connect(on_progress)
+        worker.file_done.connect(lambda r: (fd_count.__setitem__(0, fd_count[0] + 1), events.append("D")))
+        worker.finished.connect(lambda: events.append("F"))
 
         worker.process()
 
-        # 变异后：所有 file_done 时间应该接近 finished 时间（因为是循环后一次性发）
-        # 真实版：file_done 时间应该跨越整个 process() 期间
-        # 这里我们用"最大间距"断言：真实版最大间距 > 变异版最大间距
-        # 简单断言：变异后 finished_ts - 首个 file_done_ts 几乎为 0（同时发）
-        if len(timestamps) >= 2 and finished_ts:
-            span = finished_ts[0] - timestamps[0]
-            # 变异后 span 极小（<1ms 几乎同时）
-            # 真实版 span 通常 > 10ms（每个文件几十毫秒）
-            assert span < 0.005, f"变异后跨度 {span}s 过小，应接近 0（同时发）"
+        # ---- 守护测试的判据（真版的形状）----
+        guard_expected = [
+            "P0@fd=0", "D", "P1@fd=1", "D", "P2@fd=2", "D", "F",
+        ]
+
+        # 关键断言：守护判据对批量版**必须红**
+        assert events != guard_expected, (
+            f"❌ 守护测试无鉴别力：批量汇总版事件序列 == 真版期望 {guard_expected}。"
+            f"实测 = {events}"
+        )
+        # 批量版的实际形状（供交付报告引用）
+        assert events == ["P0@fd=0", "P1@fd=0", "P2@fd=0", "D", "D", "D", "F"], events
+
+        # 判据 B（fd 计数快照）对批量版也必须红
+        assert fd_seen_at_progress != [0, 1, 2], (
+            f"❌ 判据 B 无鉴别力：批量版 fd 快照竟然 == [0,1,2]，实测 {fd_seen_at_progress}"
+        )
+        assert fd_seen_at_progress == [0, 0, 0], (
+            f"批量版 fd 快照应为 [0,0,0]，实测 {fd_seen_at_progress}"
+        )
+
+        # 确认变异版"真跑了"（输出文件都在），不是空跑导致断言侥幸成立
+        for i in range(3):
+            assert (out_root / f"f{i}_redacted.docx").exists()
