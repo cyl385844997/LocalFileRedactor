@@ -34,6 +34,10 @@
     P3   元数据清洗：``/Info`` 六字段 + XMP（详见
          :mod:`redactor.handlers.pdf_metadata`）。
          位置标签 ``元数据 /Title`` / ``元数据 XMP``，``page_index = -1``。
+    P3b  结构清洗：书签 / 注释 / 链接 / 内嵌文件 / 表单域 / 页面标签
+         （详见 :mod:`redactor.handlers.pdf_structures`）。
+         位置标签 ``书签 第 1 条`` / ``第 1 页 注释 第 1 个`` 等，
+         ``page_index = -1``，**不带任何用户数据**。
 """
 
 from __future__ import annotations
@@ -60,6 +64,11 @@ from redactor.handlers.pdf_common import (
     write_placeholder,
 )
 from redactor.handlers.pdf_metadata import scrub_metadata
+from redactor.handlers.pdf_structures import (
+    park_freetext_annots,
+    restore_freetext_annots,
+    scrub_structures,
+)
 
 #: 无文本层时给用户的原因码（复用基类的 CORRUPTED 不合适，单独一个更明确）
 NO_TEXT_LAYER = "pdf_no_text_layer"
@@ -142,25 +151,46 @@ class PdfHandler(BaseHandler):
             # dry_run 时也会执行，但不会 save，故源文件不受影响，
             # 且 dry-run 报告能准确反映元数据里的命中数。
             meta = scrub_metadata(doc, engine)
-            if meta.matches:
-                flat = [h.match for h in all_hits]
-                flat.extend(meta.matches)
+
+            # --- P3b：结构清洗（书签/注释/链接/内嵌文件/表单域/页面标签）---
+            # 与元数据同理放在 _scan 之外（_scan 是只读语义，这里是写入）。
+            # 🔴 start_seq 必须续 P3 的号：两处都用 page_index = -1，
+            #    若各自从 0 编号会撞键，后写的标签覆盖先写的、报告少报。
+            struct = scrub_structures(
+                doc, engine, start_seq=len(meta.matches)
+            )
+
+            flat = [h.match for h in all_hits]
+            flat.extend(meta.matches)
+            flat.extend(struct.matches)
+            if meta.matches or struct.matches:
                 for seq, (m, label) in enumerate(
                     zip(meta.matches, meta.labels), start=1
                 ):
                     locations[location_key(m)] = f"{label} 第 {seq} 处"
-                # 重新聚合：stats 必须含元数据命中，否则报告少报
+                for seq, (m, label) in enumerate(
+                    zip(struct.matches, struct.labels), start=1
+                ):
+                    locations[location_key(m)] = f"{label}"
+                # 重新聚合：stats 必须含元数据与结构命中，否则报告少报
                 stats = RedactionEngine.aggregate(
                     flat, locations, key_of=location_key
                 )
+            if meta.matches:
                 diagnostics["meta_hits"] = len(meta.matches)
                 diagnostics["meta_fields"] = meta.fields_touched
             diagnostics["meta_warnings"] = meta.warnings
             diagnostics["meta_touched"] = meta.fields_touched
+            if struct.matches:
+                diagnostics["struct_hits"] = len(struct.matches)
+                diagnostics["struct_parts"] = struct.parts_touched
+            diagnostics["struct_warnings"] = struct.warnings
+            diagnostics["struct_parts"] = struct.parts_touched
 
             loc_note = self.describe_location_mode(diagnostics)
             warn_note = self.describe_metadata_warnings(diagnostics)
 
+            total_hits = len(all_hits) + len(meta.matches) + len(struct.matches)
             if dry_run:
                 return FileResult(
                     source=str(source),
@@ -168,7 +198,7 @@ class PdfHandler(BaseHandler):
                     status="ok",
                     hits=stats,
                     message=(
-                        f"发现 {len(all_hits) + len(meta.matches)} 处命中"
+                        f"发现 {total_hits} 处命中"
                         f"（dry-run，未写文件）{loc_note}{warn_note}"
                     ),
                 )
@@ -177,23 +207,41 @@ class PdfHandler(BaseHandler):
             prepare_output(
                 source, output, overwrite_output=overwrite_output
             )
+            # 🔴 P3b：涂改前把 FreeText 注释停放到页外。
+            # apply_redactions() 会删除与涂改矩形**相交**的注释（12 种参数
+            # 组合全部如此，无参数可控），而 extract_spans 用的
+            # get_text("dict") **包含注释的渲染文本** —— 于是"正文命中
+            # 压在注释上"会把注释连同它的清洗结果一起删掉。
+            # 停放/还原的保真度与范围收窄理由见 pdf_structures 模块注释。
+            parked = park_freetext_annots(doc)
             failed = self._redact(doc, all_hits, locations)
+            restored = restore_freetext_annots(doc, parked)
+            if len(parked) != restored:
+                diagnostics.setdefault("struct_warnings", []).append(
+                    f"{len(parked) - restored} 个批注（FreeText）在脱敏后"
+                    f"未能复位到原位置，请人工核查"
+                )
 
             # garbage=4 会清理未引用的对象；deflate 压缩。
             # 二者共同保证被涂掉的文字不残留在内容流里
             # （由 pdf_verify.verify_residue 做源/输出差分验证）。
+            # 🔴 P3b 硬要求：内嵌文件 embfile_del 掉的旧内容对象，
+            #    只有 garbage=4 才会回收（实测不加时字节层仍可检出）。
             doc.save(str(output), garbage=4, deflate=True)
 
             note = ""
             if failed:
                 note = f"；{len(failed)} 处占位符写入失败（区域过窄），已删除但未写回占位符"
+            # 停放失败/未复位的告警在落盘后才产生，须在 save 之后重算
+            # （否则新追加的 struct_warnings 不会出现在用户可见消息里）。
+            warn_note = self.describe_metadata_warnings(diagnostics)
             return FileResult(
                 source=str(source),
                 output=str(output),
                 status="ok",
                 hits=stats,
                 message=(
-                    f"已处理 {len(all_hits) + len(meta.matches)} 处命中"
+                    f"已处理 {total_hits} 处命中"
                     f"{note}{loc_note}{warn_note}"
                 ),
             )
@@ -449,6 +497,17 @@ class PdfHandler(BaseHandler):
             parts.append(
                 f"{meta_hits} 处在文档元数据里（{shown}{more}）"
             )
+        struct_hits = int(diagnostics.get("struct_hits", 0) or 0)
+        if struct_hits:
+            # 结构载体（书签/注释/链接/内嵌文件/表单域/页面标签）同样
+            # 不属于正文，但**有具体的载体名**，比"元数据"更好懂。
+            # 位置标签刻意只用序号（不带文件名/字段名）—— 那些是用户数据。
+            touched = dict(diagnostics.get("struct_parts", {}) or {})
+            shown = "、".join(
+                f"{k} {v} 处" for k, v in touched.items() if v
+            )
+            more = f"（{shown}）" if shown else ""
+            parts.append(f"{struct_hits} 处在书签/批注/链接/附件/表单等结构里{more}")
         if not parts:
             return ""
         return "；定位：" + "，".join(parts)
@@ -462,13 +521,18 @@ class PdfHandler(BaseHandler):
         1. **跨节点敏感串**：XMP 里敏感串被 XML 标签拆开，任何单节点
            视角都识别不出，本工具无法自动清洗。**绝不静默漏掉**。
         2. **XML 回退**：清洗后 XML 非法，已退回原文（该处未清洗）。
+        3. **结构告警**（P3b）：内嵌文件内容未清洗 / LAUNCH 结构异常 /
+           某条书签无法定位对象 —— 都是"用户必须知道"的残留风险。
 
         为什么告警要进 ``message`` 而不只是日志：
             用户拿到的是一份"看起来已脱敏"的文件。若元数据里其实还有
             残留而报告不提，用户不会去核对 —— 这正是本项目最忌讳的
             "给了看似安全的假象"。
         """
-        warnings = list(diagnostics.get("meta_warnings", []) or [])
+        warnings = [
+            *(diagnostics.get("meta_warnings", []) or []),
+            *(diagnostics.get("struct_warnings", []) or []),
+        ]
         if not warnings:
             return ""
         return "；⚠️ " + "；⚠️ ".join(str(w) for w in warnings)
