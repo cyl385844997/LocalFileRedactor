@@ -1,10 +1,10 @@
-"""主窗口（v0.6.1 拖拽 + 批量接通版）。
+"""主窗口（v0.6.2 处理 + 进度接通版）。
 
 布局:
     +---------------------------------------------------------+
     | 菜单栏 (File / Edit / Help)                              |
     +---------------------------------------------------------+
-    | 工具栏 (Add / Clear / Dry-run / Start / Cancel)         |
+    | 工具栏 (Clear / Dry-run / Start / Cancel)               |
     +---------------------+-----------------------------------+
     |                     | 日志 (LogPanel)                    |
     |  拖拽区             +-----------------------------------+
@@ -14,26 +14,38 @@
     | 状态栏 [进度条 StatusProgressBar]                        |
     +---------------------------------------------------------+
 
-v0.6.1 增量（v0.6.0 → v0.6.1）:
-    - Edit 菜单 "清空列表" 接通
-    - 工具栏新增 "清空" 按钮
-    - DropZoneList.files_added → 写日志 + 状态栏提示
-    - DropZoneList.files_cleared → 写日志 + 状态栏归零
-    - 公开 :meth:`clear_files` 供上述触发路径复用
+v0.6.2 增量（v0.6.1 → v0.6.2）:
+    - 工具栏 "开始" 接通 → :meth:`_on_start_clicked`
+    - 工具栏 "取消" 接通 → Controller.cancel()
+    - 工具栏 "Dry-run" checkbox 接通 → 传给 Worker
+    - 状态栏进度条接 Controller.progress 信号 → setValue + setFormat
+    - LogPanel 接 Controller.log_message → 实时追加
+    - DropZoneList 文件项状态接 Controller.file_done → "待处理" → "成功/失败/跳过"
+    - 按钮状态机 4 态：空载 / 就绪 / 运行中 / 完成（:meth:`_set_state`）
+    - Start 时弹 QFileDialog.getExistingDirectory 让用户选输出根目录
 """
-
 from __future__ import annotations
 
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from redactor.core.models import FileResult
+from redactor.gui.controller import RedactorController
 from redactor.gui.widgets import (
     DropZoneList,
     LogPanel,
     PreviewPanel,
     StatusProgressBar,
 )
+
+
+# 按钮状态机的 4 态
+_STATE_EMPTY = "empty"          # 列表空
+_STATE_READY = "ready"          # 有文件未跑
+_STATE_RUNNING = "running"      # 运行中
+_STATE_DONE = "done"            # 完成 / 取消
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -43,7 +55,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         *,
         app_name: str = "LocalFileRedactor",
-        app_version: str = "0.6.1",
+        app_version: str = "0.6.2",
+        controller: Optional[RedactorController] = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -76,9 +89,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_toolbar()
         self._build_statusbar()
 
-        # ---- 信号接通（v0.6.1 增量）----
+        # ---- 控制器 ----
+        # 默认 new 一个；测试可注入 mock controller
+        self._controller = controller if controller is not None else RedactorController(parent=self)
+
+        # ---- 信号接通 ----
         self._drop_zone.files_added.connect(self._on_files_added)
         self._drop_zone.files_cleared.connect(self._on_files_cleared)
+        # Controller 信号 → MainWindow 槽
+        self._controller.started.connect(self._on_controller_started)
+        self._controller.progress.connect(self._on_progress)
+        self._controller.file_done.connect(self._on_file_done)
+        self._controller.log_message.connect(self._on_log_message)
+        self._controller.cancelled.connect(self._on_controller_cancelled)
+        self._controller.finished.connect(self._on_controller_finished)
+
+        # 初始状态：空载
+        self._set_state(_STATE_EMPTY)
 
     # ---------------------------------------------------------- 内部构造
     def _wrap_with_header(
@@ -86,7 +113,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> QtWidgets.QWidget:
         """包一层带标题的容器，让 QSplitter 每个区域都有清晰标签。"""
         wrap = QtWidgets.QWidget(self)
-        v = QtWidgets.QVBoxLayout(wrap)
+        v = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.Direction.TopToBottom, wrap)
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(4)
         label = QtWidgets.QLabel(title, wrap)
@@ -108,7 +135,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         m_edit = bar.addMenu("编辑(&E)")
         self._act_clear = m_edit.addAction("清空列表(&C)")
-        # v0.6.1 接通
         self._act_clear.triggered.connect(self.clear_files)
         m_edit.addSeparator()
         m_edit.addAction("首选项…（v0.4 预留）").setEnabled(False)
@@ -122,7 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setMovable(False)
         tb.setIconSize(QtCore.QSize(16, 16))
 
-        # v0.6.1：新增 "清空" 按钮（与 Edit 菜单共用触发路径）
+        # v0.6.1：清空按钮
         self._act_clear_tb = QtGui.QAction("清空", self)
         self._act_clear_tb.setToolTip("清空待处理文件列表（v0.6.1）")
         self._act_clear_tb.triggered.connect(self.clear_files)
@@ -130,23 +156,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tb.addSeparator()
 
+        # v0.6.2：Dry-run checkbox
         self._act_dry_run = QtGui.QAction("Dry-run", self)
         self._act_dry_run.setCheckable(True)
         self._act_dry_run.setChecked(False)
-        self._act_dry_run.setToolTip("勾选后只扫描不写文件（v0.6.2 实装）")
+        self._act_dry_run.setToolTip("勾选后只扫描不写文件（v0.6.2 接通）")
         tb.addAction(self._act_dry_run)
 
         tb.addSeparator()
 
-        # v0.6.0 占位 —— Start / Cancel 在 v0.6.2 接 QThread
+        # v0.6.2：Start 接通
         self._act_start = QtGui.QAction("开始", self)
-        self._act_start.setEnabled(False)
-        self._act_start.setToolTip("v0.6.2 实现")
+        self._act_start.setShortcut(QtGui.QKeySequence("Ctrl+Return"))
+        self._act_start.setToolTip("开始处理（Ctrl+Enter）")
+        self._act_start.triggered.connect(self._on_start_clicked)
         tb.addAction(self._act_start)
 
+        # v0.6.2：Cancel 接通
         self._act_cancel = QtGui.QAction("取消", self)
-        self._act_cancel.setEnabled(False)
-        self._act_cancel.setToolTip("v0.6.2 实现")
+        self._act_cancel.setToolTip("取消当前任务（不打断正在处理的文件）")
+        self._act_cancel.triggered.connect(self._on_cancel_clicked)
         tb.addAction(self._act_cancel)
 
     def _build_statusbar(self) -> None:
@@ -154,6 +183,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self._progress = StatusProgressBar(self)
         sb.addPermanentWidget(self._progress)
         sb.showMessage("就绪")
+
+    # ---------------------------------------------------------- 状态机
+    def _set_state(self, state: str) -> None:
+        """按钮状态机 4 态切换（§9 裁定）。
+
+        详见 v0.6.2_方案.md 第 9 节。
+        """
+        self._state = state
+        if state == _STATE_EMPTY:
+            self._act_start.setEnabled(False)
+            self._act_cancel.setEnabled(False)
+            self._act_dry_run.setEnabled(True)
+            self._act_clear_tb.setEnabled(False)
+        elif state == _STATE_READY:
+            self._act_start.setEnabled(True)
+            self._act_cancel.setEnabled(False)
+            self._act_dry_run.setEnabled(True)
+            self._act_clear_tb.setEnabled(True)
+        elif state == _STATE_RUNNING:
+            self._act_start.setEnabled(False)
+            self._act_cancel.setEnabled(True)
+            self._act_dry_run.setEnabled(False)  # 运行中不允许切换
+            self._act_clear_tb.setEnabled(False)
+        elif state == _STATE_DONE:
+            self._act_start.setEnabled(True)
+            self._act_cancel.setEnabled(False)
+            self._act_dry_run.setEnabled(True)
+            self._act_clear_tb.setEnabled(True)
 
     # ---------------------------------------------------------- 槽
     def _show_about(self) -> None:
@@ -163,7 +220,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"<b>{self._app_name}</b> {self._app_version}<br>"
             "本地离线文件脱敏工具（docx / xlsx / pdf / txt）。<br>"
             "绝不上传、绝不覆盖原文件。<br><br>"
-            "GUI v0.6.1：拖拽 + 批量（处理/预览留 v0.6.2/v0.6.3）。",
+            "GUI v0.6.2：拖拽 + 批量 + 处理进度。预览留 v0.6.3。",
         )
 
     def _on_files_added(self, result: dict) -> None:
@@ -174,7 +231,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dirs = result.get("dirs", 0)
         reasons: list[dict] = result.get("rejected_reasons", [])  # type: ignore[assignment]
 
-        # 拒绝 / 重复逐条写日志（dirs 单行汇总）
+        # 拒绝 / 重复逐条写日志
         for entry in reasons:
             file_ = entry.get("file", "")
             reason = entry.get("reason", "")
@@ -182,7 +239,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if dirs > 0:
             self._log.append_line(f"已跳过 {dirs} 个文件夹（首版不递归）")
 
-        # 状态栏：汇总一行
+        # 状态栏汇总
         parts = []
         if added > 0:
             parts.append(f"已添加 {added} 个")
@@ -193,20 +250,161 @@ class MainWindow(QtWidgets.QMainWindow):
         if parts:
             self.statusBar().showMessage("，".join(parts) + f"（列表共 {self._drop_zone.count()} 个）")
         elif dirs > 0:
-            # 只有目录被跳过：状态栏仍要给个反馈
             self.statusBar().showMessage(f"未添加任何文件（跳过 {dirs} 个文件夹）")
+
+        # 状态机：列表非空 → 就绪
+        if self._drop_zone.count() > 0:
+            if self._state != _STATE_RUNNING:
+                self._set_state(_STATE_READY)
+        else:
+            self._set_state(_STATE_EMPTY)
 
     def _on_files_cleared(self) -> None:
         """DropZoneList.files_cleared 槽：写日志 + 状态栏归零。"""
         self._log.append_line("已清空列表")
         self.statusBar().showMessage("就绪")
+        self._set_state(_STATE_EMPTY)
+
+    # --------- v0.6.2 增量：Start / Cancel --------
+    def _on_start_clicked(self) -> None:
+        """用户点 Start：弹 QFileDialog 选输出目录 → Controller.start。"""
+        if self._controller.is_running():
+            return
+        paths = self._drop_zone.file_paths()
+        if not paths:
+            return
+
+        # §8.1 裁定：输出目录每次必弹（首版不记忆）
+        out_dir_str = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "选择输出根目录（脱敏后的文件将写入此目录下）",
+            str(Path.home()),
+        )
+        if not out_dir_str:
+            self._log.append_line("已取消选择输出目录（未开始）")
+            return
+        output_root = Path(out_dir_str)
+
+        dry_run = self._act_dry_run.isChecked()
+        mode_str = "Dry-run（不写文件）" if dry_run else "Real-run"
+        self._log.append_line(f"开始 {mode_str}：{len(paths)} 个文件 → {output_root}")
+
+        try:
+            self._controller.start(
+                paths=paths,
+                output_root=output_root,
+                dry_run=dry_run,
+                overwrite_output=True,
+            )
+        except RuntimeError as exc:
+            self._log.append_line(f"启动失败：{exc}")
+
+    def _on_cancel_clicked(self) -> None:
+        """用户点 Cancel：调 Controller.cancel()。"""
+        if not self._controller.is_running():
+            return
+        self._log.append_line("请求取消（当前文件跑完后停止）…")
+        self._controller.cancel()
+
+    # --------- v0.6.2 增量：Controller 信号槽 --------
+    def _on_controller_started(self, total: int) -> None:
+        self._set_state(_STATE_RUNNING)
+        self._progress.setRange(0, max(total, 1))
+        self._progress.setValue(0)
+        self._progress.setFormat(f"0/{total} - 准备中…")
+        self.statusBar().showMessage(f"运行中（0 / {total}）")
+
+    def _on_progress(self, idx: int, total: int, name: str) -> None:
+        # idx 是 0-based；显示成 1-based 更直观
+        self._progress.setValue(idx)
+        self._progress.setFormat(f"{idx}/{total} - 当前：{name}")
+        self.statusBar().showMessage(f"运行中（{idx} / {total} - {name}）")
+
+    def _on_file_done(self, result: FileResult) -> None:
+        """每文件跑完：更新 DropZoneList 对应行的状态。
+
+        关键：**用户要求每个文件跑完立刻 emit**，避免程序崩溃丢结果。
+        """
+        self._update_file_item_status(result.source, result.status)
+
+    def _on_log_message(self, line: str) -> None:
+        """Worker 日志实时写到 LogPanel（线程安全靠 Qt QueuedConnection）。"""
+        self._log.append_line(line)
+
+    def _on_controller_cancelled(self) -> None:
+        self._progress.setFormat(f"已取消（{self._progress.value()}/{self._progress.maximum()}）")
+        self.statusBar().showMessage("已取消")
+
+    def _on_controller_finished(self) -> None:
+        # 自然完成（cancelled 信号先发后 finished 也发）
+        if self._state == _STATE_RUNNING:
+            self._progress.setValue(self._progress.maximum())
+            self._progress.setFormat("完成")
+            self.statusBar().showMessage("完成")
+            self._set_state(_STATE_DONE)
+
+    # ---------------------------------------------------------- 辅助
+    def _update_file_item_status(self, source_path: str, status: str) -> None:
+        """把 DropZoneList 中对应路径的项状态改成成功/失败/跳过。"""
+        from redactor.gui.widgets import normalize_path
+        try:
+            target = normalize_path(source_path)
+        except OSError:
+            target = source_path
+
+        status_zh = {
+            "ok": "成功",
+            "redacted": "成功",
+            "skipped": "跳过",
+            "failed": "失败",
+        }.get(status, status)
+
+        model = self._drop_zone.model()
+        for r in range(model.rowCount()):
+            data = model.item(r).data(QtCore.Qt.ItemDataRole.UserRole)
+            if data and data.get("normalized") == target:
+                item = model.item(r)
+                # 解析原显示文本 "name    SIZE    STATUS"
+                try:
+                    parts = item.text().split("    ")
+                    if len(parts) >= 2:
+                        size_str = parts[1]
+                    else:
+                        size_str = ""
+                except (AttributeError, IndexError):
+                    size_str = ""
+                item.setText(f"{Path(source_path).name}    {size_str:>10}    {status_zh}")
+                item.setData({**data, "status": status_zh}, QtCore.Qt.ItemDataRole.UserRole)
+                break
 
     # ---------------------------------------------------------- 公开方法
     def clear_files(self) -> None:
         """清空拖拽区列表（Edit 菜单 / 工具栏按钮共用此入口）。"""
-        # 直接调 DropZoneList.clear() —— 它会发 files_cleared 信号，
-        # 由 _on_files_cleared 写日志 / 状态栏，避免双写。
         self._drop_zone.clear()
+
+    def start_processing(self, output_root: Optional[Path] = None) -> bool:
+        """测试 / 自动化入口：用预设路径跳过 QFileDialog。
+
+        Returns:
+            True 启动成功；False 启动被拒（已有任务在跑 / 列表空）。
+        """
+        if self._controller.is_running():
+            return False
+        paths = self._drop_zone.file_paths()
+        if not paths:
+            return False
+        if output_root is None:
+            return False
+        try:
+            self._controller.start(
+                paths=paths,
+                output_root=Path(output_root),
+                dry_run=self._act_dry_run.isChecked(),
+                overwrite_output=True,
+            )
+            return True
+        except RuntimeError:
+            return False
 
     # ---------------------------------------------------------- 公开 getter
     def drop_zone(self) -> DropZoneList:
@@ -221,12 +419,27 @@ class MainWindow(QtWidgets.QMainWindow):
     def progress_bar(self) -> StatusProgressBar:
         return self._progress
 
+    def controller(self) -> RedactorController:
+        return self._controller
+
     def dry_run_action(self) -> QtGui.QAction:
         return self._act_dry_run
 
     def clear_action(self) -> QtGui.QAction:
-        """公开：Edit 菜单"清空列表"动作（供测试 / 外部触发用）。"""
+        """公开：Edit 菜单"清空列表"动作（供测试 / 外部 trigger）。"""
         return self._act_clear
+
+    def start_action(self) -> QtGui.QAction:
+        """公开：工具栏"开始"按钮。"""
+        return self._act_start
+
+    def cancel_action(self) -> QtGui.QAction:
+        """公开：工具栏"取消"按钮。"""
+        return self._act_cancel
+
+    def state(self) -> str:
+        """公开：当前按钮状态机（供测试断言）。"""
+        return self._state
 
 
 __all__ = ["MainWindow"]
