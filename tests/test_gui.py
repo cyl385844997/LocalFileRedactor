@@ -55,8 +55,9 @@ def window(qapp: QtWidgets.QApplication) -> MainWindow:
 class TestGuiModule:
     def test_包常量(self):
         assert APP_NAME == "LocalFileRedactor"
-        # v0.6.2 起改前缀匹配（避免每个小版本都得改测试）
-        assert APP_VERSION.startswith("0.6"), APP_VERSION
+        # v0.6.2 起改前缀匹配（避免每个小版本都得改测试）；
+        # v1.0.0 起主版本号也已稳定在 1.x
+        assert APP_VERSION.startswith("1."), APP_VERSION
         assert APP_ORG
 
     def test_MainWindow_可从包顶层导入(self):

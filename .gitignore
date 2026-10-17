@@ -48,3 +48,12 @@ htmlcov/
 Thumbs.db
 desktop.ini
 .DS_Store
+# 打包运行时依赖（scripts/install_deps.py 安装的第三方库）
+# ★不入库：开源仓库不该包含第三方库副本（体积 + 许可）
+deps/
+
+# 打包资产中的临时文件（scripts/gen_app_assets.py 中间产物）
+assets/_tmp_*.png
+
+# PyInstaller 构建中间目录
+LocalFileRedactor.spec.bak

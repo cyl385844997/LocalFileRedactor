@@ -72,7 +72,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         *,
         app_name: str = "LocalFileRedactor",
-        app_version: str = "0.6.3",
+        app_version: str = "1.0.0",
         controller: Optional[RedactorController] = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:

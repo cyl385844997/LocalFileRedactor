@@ -48,7 +48,7 @@ __all__ = [
 
 APP_NAME = "LocalFileRedactor"
 APP_ORG = "LocalFileRedactor"
-APP_VERSION = "0.6.3"
+APP_VERSION = "1.0.0"
 
 # PySide6 imports are deferred to submodules so this package import never crashes
 # even if PySide6 is not installed. The submodule-level imports fail loudly only
