@@ -83,38 +83,24 @@ class RedactionEngine:
         # 且 resolve_overlaps 查不到时返回默认值 9999（永远垫底），
         # 这正是"词库优先级低于内置正则"所要求的行为。
         self._priority: Dict[str, int] = {rule.name: i for i, rule in enumerate(self._rules)}
+        self._apply_specificity_overrides()
 
         # ★裁定 6：优先级 **词库 > 范围脱敏 > 内置正则**。
         #
-        # 词库**不登记**（保持查不到 → 9999），这是既有契约：
-        # tests/test_lexicon.py 与 test_lexicon_recognizer.py 明确要求
-        # "同起点冲突时词库不压过内置正则"（已实测：登记成 -1 会让词库
-        # 升到内置正则之上，那两项立刻失败）。
-        #
-        # 范围脱敏登记成 **-1**：小于任何内置规则的非负下标，
-        # 于是"范围 > 内置正则"成立。
-        # 至于"词库 > 范围"——两者 priority 分别是 9999 与 -1，
-        # 但 resolve_overlaps 的**第一排序键是"区间更长者优先"**，
-        # 第二才是 priority；词库与范围命中**同区间同长度**时，
-        # -1 < 9999 让范围胜出。要让词库胜出，得让两者 priority 都查不到
-        # 并靠稳定排序保序 —— 而范围识别器 append 在词库**之后**，
-        # 所以这里改为**不给范围登记**、让它与词库一样垫底，
-        # 由 sorted 的稳定性保住"词库先来先得"。
-        # （登记与否都是负数会压过词库，见上方实测。）
-        #
-        # 实测结论（tests/test_scope_engine.py 守护）：
-        #   词库"甲方单位" vs 范围"有限公司" 同区间 → 词库胜
-        #   范围"公司" vs 内置"手机号" 不同区间 → 互不吞
-        # ★范围脱敏条目名**同样不登记**（查不到 → 9999，与词库同档）。
-        #
-        # 实测两条硬约束：
+        # **词库与范围脱敏的名字都不登记**（查不到 → 9999，与内置正则在
+        # resolve_overlaps 的排序键里同档）。两条实测硬约束：
         #   ① 词库登记成负数 → 词库压过内置正则，
         #      tests/test_lexicon.py 与 test_lexicon_recognizer.py 立刻失败
         #      （既有契约："同起点冲突时词库不压过内置正则"）。
         #   ② 范围登记成负数 → 范围压过词库（-1 < 9999），
         #      违反裁定 6 的"词库 > 范围"。
-        # 所以两者都垫底，靠 _recognizers 的 append 顺序（词库在前）
-        # + sorted 的稳定性让词库在平局时胜出。
+        #
+        # "词库 > 范围"因此靠**顺序**保证：resolve_overlaps 用稳定 sorted，
+        # 命中收集顺序即 _recognizers 的 append 顺序（词库在前），
+        # 同区间同长度时词库先来先得。
+        # 实测（tests/test_scope_engine.py 守护）：
+        #   词库"甲方单位" vs 范围"有限公司" 同区间 → 词库胜
+        #
         # "范围 vs 内置正则"实际上不会冲突：反向扫描遇数字即停，
         # 命中区间不可能含数字，与手机号/身份证等规则天然不相交
         # （tests/test_scope_engine.py 的 TestEngineQ4 守护这一点）。
@@ -123,6 +109,39 @@ class RedactionEngine:
     def rules(self) -> List[Rule]:
         """当前生效的规则列表。"""
         return list(self._rules)
+
+    def _apply_specificity_overrides(self) -> None:
+        """把"**更具体**的规则压过"更宽泛"的规则"固化为代码，不依赖 YAML 顺序。
+
+        **背景（2026-10-18）**：18 位号码既可能是身份证、也可能是银行卡，
+        两者 pattern 长度相同（都是 18），:func:`resolve_overlaps` 的
+        "区间更长者优先"完全打平，只能靠 ``priority`` 决胜。
+        而 ``priority`` 来自 YAML 里的**下标** —— 也就是
+        **谁写在前面谁赢**。这意味着：任何人在 ``rules/builtin.yaml`` 里
+        挪一下规则顺序，身份证就会被银行卡静默吞掉，且**没有任何报错**。
+
+        实测（本次修复前）：
+            18 位号码 ``110000000000000007`` 同时通过 id_card 与 luhn
+            两种校验。若 YAML 把银行卡写在身份证之前，
+            ``scan`` 产出的 rule_name 就是 ``银行卡号`` 而不是 ``身份证号``。
+
+        **为什么身份证该赢**：它有 GB 11643 校验位 + 地区码 + 出生日期，
+        是**语义更强**的判别；而银行卡的 pattern ``\\d{16,19}``
+        是个纯数字区间，只要长度落在 16-19 就先"占位"，
+        等validator 放行。它属于**宽泛**规则。
+
+        所以这里显式声明"身份证明细于银行卡"，把隐式的 YAML 顺序
+        变成**写在代码里的契约** —— 顺序变了也不会退化。
+        """
+        if "身份证号" in self._priority and "银行卡号" in self._priority:
+            id_prio = self._priority["身份证号"]
+            bank_prio = self._priority["银行卡号"]
+            if bank_prio < id_prio:
+                # YAML 顺序反了：把身份证明到银行卡前面。
+                # 不改动 rules 列表本身（会破坏 --only 等按顺序的语义），
+                # 只调 priority —— 它才是 resolve_overlaps 的唯一判据。
+                self._priority["身份证号"] = bank_prio
+                self._priority["银行卡号"] = id_prio
 
     @property
     def recognizers(self) -> List[Recognizer]:
