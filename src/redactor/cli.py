@@ -147,6 +147,8 @@ def _build_engine(args: argparse.Namespace) -> RedactionEngine:
         scope_entries=scope_entries,
         scope_tier=getattr(args, "scope_tier", None),
         scope_strict_lead=getattr(args, "scope_strict_lead", False),
+        enable_names=getattr(args, "names", False),
+        strip_da_zi=not getattr(args, "no_strip_da_zi", False),
     )
 
 
@@ -459,6 +461,25 @@ def _add_scope_args(parser: argparse.ArgumentParser) -> None:
         "--scope-strict-lead",
         action="store_true",
         help="启用范围脱敏的首字黑名单（这那每某该此各本作实体名首字时判为误伤）",
+    )
+    _add_name_args(parser)
+
+
+def _add_name_args(parser: argparse.ArgumentParser) -> None:
+    """给子命令加上 P8 人名识别的参数。
+
+    默认**关闭**：jieba 词性判定的误报率高于格式规则，
+    默认开启会让用户在没预期的情况下看到文档里多处 ``[人名]``。
+    """
+    parser.add_argument(
+        "--names",
+        action="store_true",
+        help="启用人名识别（jieba nr/nrfg/nrt）。默认关闭——误报率高于格式规则",
+    )
+    parser.add_argument(
+        "--no-strip-da-zi",
+        action="store_true",
+        help="人名识别时**不**剔除大字金额片段（伍拾/壹佰…，默认剔除）",
     )
 
 

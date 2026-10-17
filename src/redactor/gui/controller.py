@@ -59,6 +59,9 @@ class RedactorController(QtCore.QObject):
         self._scope_entries: List[ScopeEntry] = []
         self._scope_tier: Optional[str] = None
         self._scope_strict_lead = False
+        # P8 人名识别（默认关闭）
+        self._enable_names = False
+        self._strip_da_zi = True
 
     # ----------------------------------------------------- P7 范围脱敏
     def set_scope(
@@ -86,6 +89,22 @@ class RedactorController(QtCore.QObject):
     def scope_entries(self) -> List[ScopeEntry]:
         """当前范围脱敏配置（只读副本）。"""
         return list(self._scope_entries)
+
+    # ----------------------------------------------------- P8 人名识别
+    def set_names(self, *, enabled: bool, strip_da_zi: bool = True) -> None:
+        """设置人名识别开关（P8）。
+
+        与 :meth:`set_scope` 同样**运行中拒绝** —— 已启动的 worker
+        用的是旧 engine，改了要等下次 start 才生效。
+        """
+        if self.is_running():
+            return
+        self._enable_names = bool(enabled)
+        self._strip_da_zi = bool(strip_da_zi)
+
+    def names_enabled(self) -> bool:
+        """人名识别是否启用。"""
+        return self._enable_names
 
     # ----------------------------------------------------- 状态查询
     def is_running(self) -> bool:
@@ -119,6 +138,8 @@ class RedactorController(QtCore.QObject):
             scope_entries=self._scope_entries,
             scope_tier=self._scope_tier,
             scope_strict_lead=self._scope_strict_lead,
+            enable_names=self._enable_names,
+            strip_da_zi=self._strip_da_zi,
         )
 
         # 2. 新建 Worker + Thread

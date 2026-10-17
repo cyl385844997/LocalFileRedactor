@@ -49,6 +49,8 @@ def build_engine_for_gui(
     scope_entries: Optional[Sequence[ScopeEntry]] = None,
     scope_tier: Optional[str] = None,
     scope_strict_lead: bool = False,
+    enable_names: bool = False,
+    strip_da_zi: bool = True,
 ) -> RedactionEngine:
     """为 GUI 构造 RedactionEngine（无 argparse.Namespace 依赖）。
 
@@ -85,6 +87,8 @@ def build_engine_for_gui(
         scope_entries=scope_entries,
         scope_tier=scope_tier,
         scope_strict_lead=scope_strict_lead,
+        enable_names=enable_names,
+        strip_da_zi=strip_da_zi,
     )
 
 

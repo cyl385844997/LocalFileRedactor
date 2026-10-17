@@ -14,6 +14,7 @@ from redactor.core.lexicon import LexiconEntry
 from redactor.core.models import HitStat, Match, Rule
 from redactor.core.scopes import ScopeEntry
 from redactor.recognizers.base import Recognizer
+from redactor.recognizers.name_recognizer import build_name_recognizer
 from redactor.recognizers.lexicon_recognizer import build_lexicon_recognizer
 from redactor.recognizers.regex_recognizer import build_recognizer
 from redactor.recognizers.scope_recognizer import build_scope_recognizer
@@ -32,6 +33,8 @@ class RedactionEngine:
         scope_entries: Optional[Sequence[ScopeEntry]] = None,
         scope_tier: Optional[str] = None,
         scope_strict_lead: bool = False,
+        enable_names: bool = False,
+        strip_da_zi: bool = True,
     ):
         """初始化引擎。
 
@@ -42,6 +45,9 @@ class RedactionEngine:
             scope_entries: P7 范围脱敏条目（来自 :mod:`redactor.core.scopes`）。
             scope_tier: 范围脱敏的全局严格度覆盖（None 时逐条用 ``entry.tier``）。
             scope_strict_lead: True 时启用范围脱敏的首字黑名单（激进档）。
+            enable_names: P8 人名识别开关。**默认 False** —— 人名识别
+                误报率高于格式规则（依赖 jieba 词性），必须由用户显式开启。
+            strip_da_zi: 人名识别时是否剔除大字金额片段（``伍拾``/``壹佰``…）。
         """
         if not rules:
             raise ValueError("规则列表为空，无法启动脱敏引擎")
@@ -77,6 +83,15 @@ class RedactionEngine:
                 strict_lead=scope_strict_lead,
             )
             self._recognizers.append(self._scope_recognizer)
+        # P8 人名识别：**默认关闭**（误报率高于格式规则，须用户显式开启）。
+        # jieba 是可选依赖，未安装时 build_name_recognizer 返回 None，直接跳过。
+        self._name_recognizer: Optional[object] = None
+        if enable_names:
+            self._name_recognizer = build_name_recognizer(
+                strip_da_zi=strip_da_zi
+            )
+            if self._name_recognizer is not None:
+                self._recognizers.append(self._name_recognizer)
         # 编号分配器必须是"每次任务一个"，否则编号会跨文件延续
         self._replacer = PlaceholderReplacer(self._rules, force_numbered=force_numbered)
         # 词库条目名不进入 _priority：它们不在 PlaceholderReplacer 的规则表里，
@@ -104,6 +119,11 @@ class RedactionEngine:
         # "范围 vs 内置正则"实际上不会冲突：反向扫描遇数字即停，
         # 命中区间不可能含数字，与手机号/身份证等规则天然不相交
         # （tests/test_scope_engine.py 的 TestEngineQ4 守护这一点）。
+        #
+        # P8 人名规则同理垫底（不登记）：它最不可能压过格式规则 ——
+        # jieba 的词边界与数字/邮箱的边界天然不重合。
+        # **万一重合**（如"张三13812345678"），因人名在前（append 更早）、
+        # 长度通常更短，"更长者优先"会让手机号胜出，正确。
 
     @property
     def rules(self) -> List[Rule]:

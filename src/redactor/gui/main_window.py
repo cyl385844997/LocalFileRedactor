@@ -48,6 +48,7 @@ from redactor.core.scopes import (
     ScopeEntry,
 )
 from redactor.gui.controller import RedactorController
+from redactor.recognizers.name_recognizer import jieba_available
 from redactor.gui.widgets import (
     DropZoneList,
     LogPanel,
@@ -226,6 +227,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._act_scopes.setChecked(False)
         self._act_scopes.triggered.connect(self._on_scopes_clicked)
         tb.addAction(self._act_scopes)
+
+        tb.addSeparator()
+
+        # P8：人名识别开关（**默认关闭**）
+        self._act_names = QtGui.QAction("人名识别", self)
+        self._act_names.setToolTip(
+            "用 jieba 词性识别人名并脱敏（v0.8.0）。"
+            "误报率高于格式规则，故默认关闭"
+        )
+        self._act_names.setCheckable(True)
+        self._act_names.setChecked(False)
+        self._act_names.toggled.connect(self._on_names_toggled)
+        tb.addAction(self._act_names)
+
+        # 大字金额剔除（只有开了人名识别才有意义）
+        self._act_strip_da_zi = QtGui.QAction("剔除大字金额", self)
+        self._act_strip_da_zi.setToolTip(
+            "剔除被误判成人名的大字金额片段（伍拾/壹佰…）。默认开启"
+        )
+        self._act_strip_da_zi.setCheckable(True)
+        self._act_strip_da_zi.setChecked(True)
+        self._act_strip_da_zi.setEnabled(False)
+        self._act_strip_da_zi.toggled.connect(self._on_strip_da_zi_toggled)
+        tb.addAction(self._act_strip_da_zi)
+
+    def _on_names_toggled(self, checked: bool) -> None:
+        """P8 开关：人名识别。"""
+        self._act_strip_da_zi.setEnabled(checked)
+        self._controller.set_names(
+            enabled=checked,
+            strip_da_zi=self._act_strip_da_zi.isChecked(),
+        )
+        msg = "人名识别已启用" if checked else "人名识别已关闭"
+        if checked and not jieba_available():
+            msg += "（★ jieba 未安装，本次不会生效）"
+        self._log.append_line(msg)
+
+    def _on_strip_da_zi_toggled(self, checked: bool) -> None:
+        """P8 开关：剔除大字金额。"""
+        self._controller.set_names(
+            enabled=self._act_names.isChecked(),
+            strip_da_zi=checked,
+        )
 
     # ---------------------------------------------------------- P7 范围脱敏
     def _on_scopes_clicked(self) -> None:
@@ -683,6 +727,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def scopes_action(self) -> QtGui.QAction:
         """公开：工具栏"范围脱敏"按钮（P7）。"""
         return self._act_scopes
+
+    def names_action(self) -> QtGui.QAction:
+        """公开：工具栏"人名识别"开关（P8）。"""
+        return self._act_names
+
+    def strip_da_zi_action(self) -> QtGui.QAction:
+        """公开：工具栏"剔除大字金额"开关（P8）。"""
+        return self._act_strip_da_zi
 
     def apply_scope_entries(
         self, entries: Sequence[ScopeEntry], *, enable: bool = True

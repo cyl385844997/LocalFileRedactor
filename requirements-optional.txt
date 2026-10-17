@@ -1,0 +1,12 @@
+# 可选依赖（不影响核心功能，缺失时对应功能自动降级）
+#
+# 设计原则：**可选依赖缺失绝不阻断主流程**。
+#   - 装了就多一个功能（人名识别）
+#   - 没装就少一个功能，程序照常跑
+#   验证：tests/test_name_recognizer.py 的 TestNameRecognizerBasic::
+#         test_工厂返回None当jieba缺失 / test_找在缺依赖时返回空
+#
+# 安装（建议装到项目本地隔离目录，不要污染系统环境）：
+#   pip install --target=.verify_libs jieba
+
+jieba>=0.42.1
