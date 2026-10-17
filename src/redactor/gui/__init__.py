@@ -4,7 +4,7 @@
 core / recognizers / redactors / handlers / report 均不得依赖 GUI，
 以保证核心库可被 CLI、GUI、以及将来的其他前端复用。
 
-模块清单（v0.6.2 处理 + 进度接通版）:
+模块清单（v0.6.3 预览 + 打开输出接通版）:
 - :mod:`redactor.gui.widgets` — 复用控件（拖拽区 / 日志区 / 预览区）
 - :mod:`redactor.gui.main_window` — :class:`QMainWindow` 子类
 - :mod:`redactor.gui.controller` — :class:`RedactorController`（线程 + 信号桥）
@@ -24,7 +24,15 @@ core / recognizers / redactors / handlers / report 均不得依赖 GUI，
     - 关键：**每个文件跑完立刻 emit file_done**，不等汇总（防崩溃丢结果）
     - MainWindow 按钮状态机 4 态：empty / ready / running / done
     - 进度条接 progress 信号（setMaximum + setValue + setFormat）
-    预览留 v0.6.3。
+
+📌 v0.6.3 = 预览 + 打开输出：
+    - PreviewPanel 命中表接通：4 列（# / 文件 / 规则 / 位置）
+    - ★裁定 1：位置列只显示"N 处"，**不展开 locations**（收进 tooltip）
+    - ★裁定 4：命中表 500 行截断 + 顶部提示"仅展示前 500 条"
+    - 拖拽区双击 → 已产出开输出、未产出开源源（★裁定 2）
+    - 输出列表双击 → 打开该路径
+    - 工具栏"打开输出目录" → 只记最近一次，**不弹窗**（★裁定 3）
+    - GUI 中**不出现任何原文**（HitStat 结构保证，测试专门守这条）
 """
 from __future__ import annotations
 
@@ -40,7 +48,7 @@ __all__ = [
 
 APP_NAME = "LocalFileRedactor"
 APP_ORG = "LocalFileRedactor"
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.3"
 
 # PySide6 imports are deferred to submodules so this package import never crashes
 # even if PySide6 is not installed. The submodule-level imports fail loudly only

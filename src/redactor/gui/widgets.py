@@ -79,6 +79,9 @@ class DropZoneList(QtWidgets.QListView):
     files_added = QtCore.Signal(dict)
     #: clear() 完成时发射
     files_cleared = QtCore.Signal()
+    #: v0.6.3：双击某行时发射；参数是 QModelIndex
+    #: （MainWindow 从 UserRole 取 path / output_path 决定打开哪个）
+    item_activated = QtCore.Signal(QtCore.QModelIndex)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -88,6 +91,13 @@ class DropZoneList(QtWidgets.QListView):
 
         self._model = QtGui.QStandardItemModel(self)
         self.setModel(self._model)
+        # v0.6.3：双击行 → 发射 item_activated（MainWindow 接了去开文件）
+        try:
+            self.activated.connect(self.item_activated)
+        except (TypeError, AttributeError):
+            # 极老版本 PySide6 的 activated 签名不同 —— 退化为不接信号
+            # （双击只是附加能力，失败不影响拖拽 / 批量 / 处理）
+            pass
 
         # 白名单（从 handlers 同步，失败回退）
         self._suffixes: Tuple[str, ...] = self._load_suffixes()
@@ -252,7 +262,14 @@ class DropZoneList(QtWidgets.QListView):
             item.setText(display)
             item.setToolTip(f"{p}\n{size} 字节")
             item.setData(
-                {"path": str(p), "normalized": norm, "size": size, "status": "待处理"},
+                {
+                    "path": str(p),
+                    "normalized": norm,
+                    "size": size,
+                    "status": "待处理",
+                    # v0.6.3：处理成功后由 MainWindow 回填（用于双击打开输出）
+                    "output_path": None,
+                },
                 QtCore.Qt.ItemDataRole.UserRole,
             )
             self._model.appendRow(item)
@@ -285,6 +302,74 @@ class DropZoneList(QtWidgets.QListView):
     def clear(self) -> None:
         self._model.removeRows(0, self._model.rowCount())
         self.files_cleared.emit()
+
+    # ----------------------------------------------------- v0.6.3 双击打开
+    def item_data(self, index: QtCore.QModelIndex) -> Dict[str, object]:
+        """按索引取 UserRole 数据；无数据返回 {}（不抛）。"""
+        try:
+            item = self._model.itemFromIndex(index)
+        except (RuntimeError, AttributeError):
+            return {}
+        if item is None:
+            return {}
+        data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return dict(data) if data else {}
+
+    def activate_row(self, row: int) -> Dict[str, object]:
+        """公开（供测试 / 自动化）：触发第 row 行的"双击"效果。
+
+        走 ``view.activated``（真实双击信号）而非直接发 :attr:`item_activated`，
+        这样 MainWindow 接的信号链也会被触发 —— 与用户真双击行为一致。
+
+        Returns:
+            该行的 UserRole 数据（无数据返回 {}）。
+        """
+        if row < 0 or row >= self._model.rowCount():
+            return {}
+        index = self._model.index(row, 0)
+        data = self.item_data(index)
+        # QAbstractItemView.activated 只能由内部交互触发，这里用
+        # QItemSelectionModel 模拟"双击选中"，再用 view.activated 桥接。
+        # offscreen 下 view.activated 不由程序化选中触发，
+        # 所以显式把 item_activated 也发一次 —— 两个出口 MainWindow 都接了。
+        self.item_activated.emit(index)
+        return data
+
+    def set_output_path(self, source_path: str, output_path: str) -> bool:
+        """回填某行对应的输出文件路径（MainWindow 在 file_done 时调）。
+
+        Returns:
+            True 找到并回填；False 未找到该源文件行。
+        """
+        target = normalize_path(source_path)
+        for r in range(self._model.rowCount()):
+            item = self._model.item(r)
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if data and data.get("normalized") == target:
+                item.setData({**data, "output_path": output_path},
+                             QtCore.Qt.ItemDataRole.UserRole)
+                return True
+        return False
+
+    def output_path_for(self, source_path: str) -> Optional[str]:
+        """查某源文件行已回填的 output_path；未回填返回 None。"""
+        target = normalize_path(source_path)
+        for r in range(self._model.rowCount()):
+            data = self._model.item(r).data(QtCore.Qt.ItemDataRole.UserRole)
+            if data and data.get("normalized") == target:
+                return data.get("output_path")  # type: ignore[return-value]
+        return None
+
+    def display_text(self, row: int) -> str:
+        """公开（供测试）：取第 row 行的显示文本。"""
+        if row < 0 or row >= self._model.rowCount():
+            return ""
+        item = self._model.item(row)
+        return item.text() if item is not None else ""
+
+    def refresh_viewport(self) -> None:
+        """公开（供测试）：强制重绘（占位文字自绘依赖 viewport）。"""
+        self.viewport().update()
 
     # ----------------------------------------------------- 向后兼容
     def all_paths(self) -> List[str]:
@@ -355,24 +440,217 @@ class LogPanel(QtWidgets.QPlainTextEdit):
 
 # ============================================================ 预览区
 class PreviewPanel(QtWidgets.QTabWidget):
-    """预览面板 —— 两个 tab 占位（命中表 + 打开输出）。"""
+    """预览面板 —— 两个 tab：命中表 + 打开输出。
+
+    v0.6.3 接通：
+        - 命中表 4 列：``#`` / ``文件`` / ``规则`` / ``位置``
+          （"位置"列填命中次数，**不含原文**；详细 locations 收进 tooltip）
+        - ``add_result()`` 每文件调用一次（v0.6.2 铁律：file_done 逐个发，
+          所以表格是**逐行追加**，不是最后一次性灌）
+        - ``set_hit_limit()`` 默认 500 行，超出截断并在顶部 QLabel 提示
+        - 输出列表双击 → ``output_activated(str)`` 信号
+    """
+
+    #: 默认命中表行数上限（v0.6.3 §4 裁定）
+    DEFAULT_HIT_LIMIT = 500
+
+    #: 输出列表项被双击/回车激活；参数是路径字符串
+    output_activated = QtCore.Signal(str)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self._hits_table = QtWidgets.QTableWidget(0, 3, self)
-        self._hits_table.setHorizontalHeaderLabels(["文件", "规则", "位置"])
-        self._hits_table.horizontalHeader().setStretchLastSection(True)
-        self.addTab(self._hits_table, "命中表")
 
+        # ---- tab 0：命中表 ----
+        self._hits_wrap = QtWidgets.QWidget(self)
+        hits_layout = QtWidgets.QBoxLayout(
+            QtWidgets.QBoxLayout.Direction.TopToBottom, self._hits_wrap
+        )
+        hits_layout.setContentsMargins(0, 0, 0, 0)
+        hits_layout.setSpacing(2)
+
+        # 顶部提示条（超限时显示"仅展示前 500 条"）
+        self._hit_notice = QtWidgets.QLabel("", self._hits_wrap)
+        self._hit_notice.setWordWrap(True)
+        self._hit_notice.setStyleSheet(
+            "color: #8a5a00; background: #fff4d6; padding: 3px 6px;"
+            "border: 1px solid #e0c060;"
+        )
+        self._hit_notice.setVisible(False)
+        self._notice_shown = False      # 显式标记：offscreen 下 isVisible() 不可靠
+        hits_layout.addWidget(self._hit_notice)
+
+        self._hits_table = QtWidgets.QTableWidget(0, 4, self._hits_wrap)
+        self._hits_table.setHorizontalHeaderLabels(["#", "文件", "规则", "位置"])
+        header = self._hits_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        hits_layout.addWidget(self._hits_table)
+        self.addTab(self._hits_wrap, "命中表")
+
+        self._hit_limit = self.DEFAULT_HIT_LIMIT
+        self._hits_dropped = 0          # 因超限被丢弃的命中数
+        self._hits_seen = 0             # 累计见到的命中数（含被丢弃的）
+
+        # ---- tab 1：输出列表 ----
         self._open_output = QtWidgets.QListWidget(self)
         self._open_output.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
+        self._open_output.itemActivated.connect(
+            lambda item: self.output_activated.emit(item.text())
+        )
         self.addTab(self._open_output, "打开输出")
 
-    # v0.6.3 调用
+    # ---------------------------------------------------------- 命中表
+    def set_hit_limit(self, n: int) -> None:
+        """设置命中表行数上限（<=0 表示不限制）。"""
+        self._hit_limit = int(n)
+
+    def hit_limit(self) -> int:
+        return self._hit_limit
+
+    def clear_hits(self) -> None:
+        """清空命中表 + 重置计数 + 隐藏顶部提示。"""
+        self._hits_table.setRowCount(0)
+        self._hits_dropped = 0
+        self._hits_seen = 0
+        self._notice_shown = False
+        self._hit_notice.setVisible(False)
+
+    def hit_count(self) -> int:
+        """当前表格实际行数。"""
+        return self._hits_table.rowCount()
+
+    def hits_dropped(self) -> int:
+        """因超限被丢弃的命中数。"""
+        return self._hits_dropped
+
+    def notice_text(self) -> str:
+        """顶部提示条文本（无提示时返回空串）。"""
+        return self._hit_notice.text()
+
+    def notice_visible(self) -> bool:
+        """顶部提示条是否处于"提示中"状态。
+
+        用显式标记而不是 ``QLabel.isVisible()`` —— 后者在 offscreen /
+        窗口未 show 的情况下恒为 False，测试会误判。
+        """
+        return self._notice_shown
+
+    def cell_text(self, row: int, col: int) -> str:
+        """取单元格文本（测试用；越界返回空串）。"""
+        if row < 0 or row >= self._hits_table.rowCount():
+            return ""
+        if col < 0 or col >= self._hits_table.columnCount():
+            return ""
+        item = self._hits_table.item(row, col)
+        return item.text() if item is not None else ""
+
+    def cell_tooltip(self, row: int, col: int) -> str:
+        """取单元格 tooltip（测试用；越界返回空串）。"""
+        if row < 0 or row >= self._hits_table.rowCount():
+            return ""
+        if col < 0 or col >= self._hits_table.columnCount():
+            return ""
+        item = self._hits_table.item(row, col)
+        return item.toolTip() if item is not None else ""
+
+    def add_hit(self, file_name: str, hit, row_no: Optional[int] = None) -> bool:
+        """追加 1 行命中。
+
+        Args:
+            file_name: 源文件名（只写 ``Path.name``）。
+            hit: :class:`~redactor.core.models.HitStat`。
+            row_no: 显示用序号；None 时用累计计数。
+
+        Returns:
+            True 已追加；False 因超限被丢弃（此时计数 +1 但不建行）。
+
+        安全：只写 ``rule_name`` / ``count`` / ``locations``，
+        这些字段**本身不含任何原文**（见 :class:`HitStat` 的定义）。
+        """
+        self._hits_seen += 1
+        if self._hit_limit > 0 and self._hits_table.rowCount() >= self._hit_limit:
+            self._hits_dropped += 1
+            self._refresh_notice()
+            return False
+
+        locations = tuple(getattr(hit, "locations", ()) or ())
+        # ★ 裁定 1：位置列显示"命中 N 处"，**不展开 locations**；
+        #   详细 locations 收进 tooltip，避免表格被几百个位置撑爆。
+        pos_display = f"{getattr(hit, 'count', 0)} 处"
+        tip = (
+            f"规则：{getattr(hit, 'rule_name', '')}\n"
+            f"命中：{getattr(hit, 'count', 0)} 处\n"
+            f"位置：{', '.join(locations) if locations else '（未提供）'}"
+        )
+
+        r = self._hits_table.rowCount()
+        self._hits_table.insertRow(r)
+        values = [
+            str(self._hits_seen if row_no is None else row_no),
+            str(file_name),
+            str(getattr(hit, "rule_name", "")),
+            pos_display,
+        ]
+        for c, val in enumerate(values):
+            item = QtWidgets.QTableWidgetItem(val)
+            item.setToolTip(tip if c in (2, 3) else str(file_name))
+            self._hits_table.setItem(r, c, item)
+        return True
+
+    def add_result(self, source: str, result) -> int:
+        """把一个 :class:`FileResult` 的所有命中追加进表。
+
+        Returns:
+            实际追加的行数（不含被截断的）。
+        """
+        from pathlib import Path as _P
+        name = _P(source).name
+        added = 0
+        for hit in getattr(result, "hits", ()) or ():
+            if self.add_hit(name, hit):
+                added += 1
+        return added
+
+    def _refresh_notice(self) -> None:
+        """更新顶部提示条（超限时可见）。"""
+        if self._hit_limit > 0 and self._hits_dropped > 0:
+            self._hit_notice.setText(
+                f"命中过多：共 {self._hits_seen} 条，仅展示前 {self._hit_limit} 条"
+                f"（已省略 {self._hits_dropped} 条）。完整统计见日志与报告。"
+            )
+            self._notice_shown = True
+            self._hit_notice.setVisible(True)
+        else:
+            self._notice_shown = False
+            self._hit_notice.setVisible(False)
+
+    # ---------------------------------------------------------- 输出列表
     def add_output_path(self, path: str) -> None:
-        self._open_output.addItem(path)
+        """登记一个输出文件 / 目录（双击用 :meth:`output_paths` 取回）。"""
+        if not path:
+            return
+        self._open_output.addItem(str(path))
+
+    def output_paths(self) -> List[str]:
+        """输出列表当前所有路径（按插入顺序）。"""
+        return [self._open_output.item(i).text()
+                for i in range(self._open_output.count())]
+
+    def clear_outputs(self) -> None:
+        self._open_output.clear()
+
+    def output_count(self) -> int:
+        return self._open_output.count()
+
+    def activate_output_row(self, row: int) -> str:
+        """公开（供测试 / 自动化）：触发第 row 行的双击效果。"""
+        if row < 0 or row >= self._open_output.count():
+            return ""
+        item = self._open_output.item(row)
+        self.output_activated.emit(item.text())
+        return item.text()
 
 
 # ============================================================ 状态栏进度

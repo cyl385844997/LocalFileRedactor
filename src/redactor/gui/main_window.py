@@ -1,10 +1,10 @@
-"""主窗口（v0.6.2 处理 + 进度接通版）。
+"""主窗口（v0.6.3 预览 + 打开输出接通版）。
 
 布局:
     +---------------------------------------------------------+
     | 菜单栏 (File / Edit / Help)                              |
     +---------------------------------------------------------+
-    | 工具栏 (Clear / Dry-run / Start / Cancel)               |
+    | 工具栏 (Clear / Dry-run / Start / Cancel / 打开输出目录) |
     +---------------------+-----------------------------------+
     |                     | 日志 (LogPanel)                    |
     |  拖拽区             +-----------------------------------+
@@ -23,6 +23,15 @@ v0.6.2 增量（v0.6.1 → v0.6.2）:
     - DropZoneList 文件项状态接 Controller.file_done → "待处理" → "成功/失败/跳过"
     - 按钮状态机 4 态：空载 / 就绪 / 运行中 / 完成（:meth:`_set_state`）
     - Start 时弹 QFileDialog.getExistingDirectory 让用户选输出根目录
+
+v0.6.3 增量（v0.6.2 → v0.6.3）:
+    - PreviewPanel 接通：4 列命中表（# / 文件 / 规则 / 位置）+ 500 行截断 + 顶部提示
+    - :meth:`_open_path` 封装 QDesktopServices（补"路径不存在"日志）
+    - :meth:`_desktop_open` 单独抽出作为唯一 QDesktopServices 出口（可测）
+    - 拖拽区双击 → :meth:`_on_drop_zone_activated`（已产出开输出 / 未产出开源源）
+    - PreviewPanel 输出列表双击 → :meth:`_on_output_activated`
+    - 工具栏 "打开输出目录" → 只用 ``_last_output_root``，**不弹窗**
+    - Controller.finished → 状态栏汇总"命中 N 条 / 输出 M 个 / 失败 K 个"
 """
 from __future__ import annotations
 
@@ -55,7 +64,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         *,
         app_name: str = "LocalFileRedactor",
-        app_version: str = "0.6.2",
+        app_version: str = "0.6.3",
         controller: Optional[RedactorController] = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
@@ -93,9 +102,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # 默认 new 一个；测试可注入 mock controller
         self._controller = controller if controller is not None else RedactorController(parent=self)
 
+        # v0.6.3：最近一次的输出根目录（"打开输出目录"按钮用它，不弹窗）
+        self._last_output_root: Optional[Path] = None
+        # v0.6.3：本次任务统计（finished 时汇总到状态栏）
+        self._stats_ok = 0
+        self._stats_failed = 0
+        self._stats_hits = 0
+
         # ---- 信号接通 ----
         self._drop_zone.files_added.connect(self._on_files_added)
         self._drop_zone.files_cleared.connect(self._on_files_cleared)
+        self._drop_zone.item_activated.connect(self._on_drop_zone_activated)
+        # v0.6.3：PreviewPanel 输出列表双击 → 打开
+        self._preview.output_activated.connect(self._on_output_activated)
         # Controller 信号 → MainWindow 槽
         self._controller.started.connect(self._on_controller_started)
         self._controller.progress.connect(self._on_progress)
@@ -178,11 +197,90 @@ class MainWindow(QtWidgets.QMainWindow):
         self._act_cancel.triggered.connect(self._on_cancel_clicked)
         tb.addAction(self._act_cancel)
 
+        # v0.6.3：打开输出目录（只记最近一次的 output_root，不弹窗）
+        self._act_open_out_dir = QtGui.QAction("打开输出目录", self)
+        self._act_open_out_dir.setToolTip(
+            "打开最近一次处理的输出目录（v0.6.3）"
+        )
+        self._act_open_out_dir.setEnabled(False)
+        self._act_open_out_dir.triggered.connect(self._on_open_out_dir_clicked)
+        tb.addAction(self._act_open_out_dir)
+
     def _build_statusbar(self) -> None:
         sb = self.statusBar()
         self._progress = StatusProgressBar(self)
         sb.addPermanentWidget(self._progress)
         sb.showMessage("就绪")
+
+    # ---------------------------------------------------------- 打开路径
+    def _desktop_open(self, url: QtCore.QUrl) -> bool:
+        """调用系统默认程序打开 url —— **唯一的** :class:`QDesktopServices` 出口。
+
+        单独抽出来是为了可测：``QDesktopServices.openUrl`` 是 PySide6 静态方法，
+        monkeypatch 它在部分版本上不生效。测试改 patch 本方法。
+        """
+        return bool(QtGui.QDesktopServices.openUrl(url))
+
+    def _open_path(self, path: str) -> bool:
+        """用系统默认程序打开 path（文件**或目录**）。
+
+        为什么自己封装而不是直接调 ``QDesktopServices.openUrl``：
+        它对不存在的路径**静默**返回 False，用户只看到"点了没反应"。
+        封装后写日志，用户知道为什么没打开。
+
+        Returns:
+            True  成功发起打开
+            False 路径不存在 / 系统无对应默认程序（日志已记录）
+        """
+        if not path:
+            self._log.append_line("无法打开：路径为空")
+            return False
+
+        p = Path(path)
+        # 目录也要能打开（用户双击输出目录行时）
+        if not p.exists():
+            self._log.append_line(f"无法打开（路径不存在）：{path}")
+            return False
+
+        url = QtCore.QUrl.fromLocalFile(str(p))
+        if self._desktop_open(url):
+            self._log.append_line(f"已打开：{path}")
+            return True
+
+        kind = "目录" if p.is_dir() else (p.suffix or "文件")
+        self._log.append_line(f"系统未找到可打开{kind}的默认程序：{path}")
+        return False
+
+    def _on_open_out_dir_clicked(self) -> None:
+        """工具栏"打开输出目录"：直接打开**最近一次**的 output_root。
+
+        ★ 裁定 3：只记最近一次，**不弹目录选择框** ——
+        跑完批处理用户想看的就是这批的输出目录，每次弹窗太烦。
+        """
+        if self._last_output_root is None:
+            self._log.append_line("尚未处理过文件，无输出目录可打开")
+            return
+        self._open_path(str(self._last_output_root))
+
+    def _on_drop_zone_activated(self, index: QtCore.QModelIndex) -> None:
+        """拖拽区双击：★ 裁定 2 —— 已产出开输出，未产出开源文件。
+
+        用户改完文件想立刻对比效果，所以优先开输出；
+        失败 / 未跑时源文件才是他想看的。
+        """
+        data = self._drop_zone.item_data(index)
+        if not data:
+            return
+        out = data.get("output_path")
+        src = data.get("path")
+        if out:
+            self._open_path(str(out))
+        elif src:
+            self._open_path(str(src))
+
+    def _on_output_activated(self, path: str) -> None:
+        """PreviewPanel 输出列表双击：打开那个路径。"""
+        self._open_path(path)
 
     # ---------------------------------------------------------- 状态机
     def _set_state(self, state: str) -> None:
@@ -220,7 +318,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"<b>{self._app_name}</b> {self._app_version}<br>"
             "本地离线文件脱敏工具（docx / xlsx / pdf / txt）。<br>"
             "绝不上传、绝不覆盖原文件。<br><br>"
-            "GUI v0.6.2：拖拽 + 批量 + 处理进度。预览留 v0.6.3。",
+            "GUI v0.6.3：拖拽 + 批量 + 处理进度 + 命中预览。",
         )
 
     def _on_files_added(self, result: dict) -> None:
@@ -260,10 +358,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_state(_STATE_EMPTY)
 
     def _on_files_cleared(self) -> None:
-        """DropZoneList.files_cleared 槽：写日志 + 状态栏归零。"""
+        """DropZoneList.files_cleared 槽：写日志 + 状态栏归零 + 清预览。"""
         self._log.append_line("已清空列表")
         self.statusBar().showMessage("就绪")
         self._set_state(_STATE_EMPTY)
+        # v0.6.3：清预览（命中表 + 输出列表 + 输出目录按钮）
+        self._preview.clear_hits()
+        self._preview.clear_outputs()
+        self._last_output_root = None
+        self._act_open_out_dir.setEnabled(False)
+        self._progress.setValue(0)
+        self._progress.setFormat("")
 
     # --------- v0.6.2 增量：Start / Cancel --------
     def _on_start_clicked(self) -> None:
@@ -288,6 +393,9 @@ class MainWindow(QtWidgets.QMainWindow):
         dry_run = self._act_dry_run.isChecked()
         mode_str = "Dry-run（不写文件）" if dry_run else "Real-run"
         self._log.append_line(f"开始 {mode_str}：{len(paths)} 个文件 → {output_root}")
+
+        # v0.6.3：记下本次 output_root（"打开输出目录"按钮用它）+ 清旧预览
+        self._prepare_run(output_root)
 
         try:
             self._controller.start(
@@ -321,11 +429,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"运行中（{idx} / {total} - {name}）")
 
     def _on_file_done(self, result: FileResult) -> None:
-        """每文件跑完：更新 DropZoneList 对应行的状态。
+        """每文件跑完：更新列表项状态 + 填命中表 + 登记输出路径。
 
         关键：**用户要求每个文件跑完立刻 emit**，避免程序崩溃丢结果。
+        v0.6.3 起同时逐行填命中表（表格看着"长出来"）。
         """
         self._update_file_item_status(result.source, result.status)
+        self._preview.add_result(result.source, result)
+
+        # 统计（finished 时汇总到状态栏）
+        if result.status in ("ok", "redacted"):
+            self._stats_ok += 1
+            self._stats_hits += getattr(result, "total_hits", 0)
+        elif result.status == "failed":
+            self._stats_failed += 1
+
+        # 成功且非 dry-run：算输出路径 + 回填列表项 + 登记到"打开输出"tab
+        if result.status in ("ok", "redacted"):
+            out = self._compute_output_path(result.source)
+            if out is not None and not self._is_dry_run():
+                self._drop_zone.set_output_path(result.source, str(out))
+                self._preview.add_output_path(str(out))
 
     def _on_log_message(self, line: str) -> None:
         """Worker 日志实时写到 LogPanel（线程安全靠 Qt QueuedConnection）。"""
@@ -340,8 +464,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._state == _STATE_RUNNING:
             self._progress.setValue(self._progress.maximum())
             self._progress.setFormat("完成")
-            self.statusBar().showMessage("完成")
             self._set_state(_STATE_DONE)
+
+            # v0.6.3：状态栏汇总（命中 / 输出 / 失败）
+            shown = self._preview.hit_count()
+            hit_txt = f"命中 {self._stats_hits} 条"
+            if self._preview.hits_dropped() > 0:
+                hit_txt += f"（表格仅展示前 {shown} 条）"
+            out_txt = f"输出 {self._preview.output_count()} 个"
+            fail_txt = f"失败 {self._stats_failed} 个" if self._stats_failed else "无失败"
+            self.statusBar().showMessage(f"完成：{hit_txt}，{out_txt}，{fail_txt}")
+            if self._preview.hits_dropped() > 0:
+                self._log.append_line(
+                    f"命中表已截断：共 {self._stats_hits} 条，"
+                    f"仅展示前 {shown} 条（省略 {self._preview.hits_dropped()} 条）"
+                )
+
+    def _compute_output_path(self, source: str) -> Optional[Path]:
+        """算某源文件的输出路径（与 Worker 的 ``_relative_output_path`` 同源）。
+
+        不重复实现路径规则 —— 直接复用 :mod:`redactor.gui.worker` 里的函数，
+        保证 GUI 显示的路径与实际落盘路径**永远一致**。
+        """
+        if self._last_output_root is None:
+            return None
+        from redactor.gui.worker import _relative_output_path
+        src = Path(source)
+        return _relative_output_path(src, src.parent, self._last_output_root)
+
+    def _is_dry_run(self) -> bool:
+        """当前 Dry-run checkbox 是否勾选（用于决定要不要登记输出路径）。"""
+        return self._act_dry_run.isChecked()
 
     # ---------------------------------------------------------- 辅助
     def _update_file_item_status(self, source_path: str, status: str) -> None:
@@ -395,16 +548,31 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if output_root is None:
             return False
+        out_path = Path(output_root)
+        self._prepare_run(out_path)
         try:
             self._controller.start(
                 paths=paths,
-                output_root=Path(output_root),
+                output_root=out_path,
                 dry_run=self._act_dry_run.isChecked(),
                 overwrite_output=True,
             )
             return True
         except RuntimeError:
             return False
+
+    def _prepare_run(self, output_root: Path) -> None:
+        """开跑前的统一前置动作（两条 start 路径共用，避免漂移）。
+
+        记 output_root / 清旧预览 / 启用"打开输出目录" / 统计归零。
+        """
+        self._last_output_root = Path(output_root)
+        self._preview.clear_hits()
+        self._preview.clear_outputs()
+        self._act_open_out_dir.setEnabled(True)
+        self._stats_ok = 0
+        self._stats_failed = 0
+        self._stats_hits = 0
 
     # ---------------------------------------------------------- 公开 getter
     def drop_zone(self) -> DropZoneList:
@@ -436,6 +604,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def cancel_action(self) -> QtGui.QAction:
         """公开：工具栏"取消"按钮。"""
         return self._act_cancel
+
+    def open_out_dir_action(self) -> QtGui.QAction:
+        """公开：工具栏"打开输出目录"按钮（v0.6.3）。"""
+        return self._act_open_out_dir
+
+    def last_output_root(self) -> Optional[Path]:
+        """公开：最近一次的输出根目录；未处理过则 None。"""
+        return self._last_output_root
 
     def state(self) -> str:
         """公开：当前按钮状态机（供测试断言）。"""
