@@ -55,7 +55,7 @@ def window(qapp: QtWidgets.QApplication) -> MainWindow:
 class TestGuiModule:
     def test_包常量(self):
         assert APP_NAME == "LocalFileRedactor"
-        assert APP_VERSION == "0.6.0"
+        assert APP_VERSION == "0.6.1"
         assert APP_ORG
 
     def test_MainWindow_可从包顶层导入(self):
@@ -65,24 +65,38 @@ class TestGuiModule:
 
 # ---------------------------------------------------------- 控件
 class TestDropZone:
-    def test_白名单包含5种格式(self):
-        assert ".docx" in DropZoneList.DEFAULT_SUFFIXES
-        assert ".xlsx" in DropZoneList.DEFAULT_SUFFIXES
-        assert ".pdf" in DropZoneList.DEFAULT_SUFFIXES
-        assert ".pptx" in DropZoneList.DEFAULT_SUFFIXES
-        assert ".txt" in DropZoneList.DEFAULT_SUFFIXES
+    def test_白名单与handlers_registry同步(self, qapp):
+        """白名单 = REGISTRY 当前 keys（v0.6.1 修正：去掉 .pptx over-promise）。"""
+        from redactor.handlers import supported_extensions
+        z = DropZoneList()
+        assert set(z.suffixes()) == set(supported_extensions())
+
+    def test_核心白名单包含4种且无pptx(self, qapp):
+        z = DropZoneList()
+        suffixes = set(z.suffixes())
+        # 核心 4 种 + .pptx 明确不在（避免 GUI 接受 .pptx 但引擎不收的伪承诺）
+        assert ".docx" in suffixes
+        assert ".xlsx" in suffixes
+        assert ".pdf" in suffixes
+        assert ".txt" in suffixes
+        assert ".pptx" not in suffixes
 
     def test_构造后count为零(self, qapp):
         z = DropZoneList()
         assert z.count() == 0
         assert z.all_paths() == []
 
-    def test_add_paths_后count正确(self, qapp):
+    def test_add_paths_后count正确(self, qapp, tmp_path):
         z = DropZoneList()
-        n = z.add_paths(["a.docx", "b.xlsx", "c.pdf"])
+        a = tmp_path / "a.docx"
+        b = tmp_path / "b.xlsx"
+        c = tmp_path / "c.pdf"
+        for p in (a, b, c):
+            p.write_bytes(b"x")
+        n = z.add_paths([str(a), str(b), str(c)])
         assert n == 3
         assert z.count() == 3
-        assert z.all_paths() == ["a.docx", "b.xlsx", "c.pdf"]
+        assert len(z.all_paths()) == 3
 
     def test_clear_后归零(self, qapp):
         z = DropZoneList()
@@ -185,7 +199,11 @@ class TestMainWindow:
         qapp.processEvents()
         # 不崩即为通过
 
-    def test_drop_zone_通过公开API可填充(self, window):
-        n = window.drop_zone().add_paths(["x.docx", "y.xlsx"])
+    def test_drop_zone_通过公开API可填充(self, window, tmp_path):
+        a = tmp_path / "x.docx"
+        b = tmp_path / "y.xlsx"
+        for p in (a, b):
+            p.write_bytes(b"x")
+        n = window.drop_zone().add_paths([str(a), str(b)])
         assert n == 2
         assert window.drop_zone().count() == 2

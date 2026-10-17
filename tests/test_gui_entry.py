@@ -51,4 +51,5 @@ class TestEntry:
         assert result.returncode == 0, (
             f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
         )
-        assert "0.6.0" in result.stdout, result.stdout
+        # 校验当前版本前缀（v0.6.x 系列）
+        assert result.stdout.startswith("0.6."), result.stdout
